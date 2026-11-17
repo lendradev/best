@@ -5,17 +5,23 @@
 *.pem
 *.key
 
-# Dependensi dan build
+# Dependencies and build output
 node_modules/
-.venv/
-__pycache__/
 dist/
 build/
 coverage/
-.next/
-target/
 
-# Lain-lain
+# Local databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Test output
+.test-output/
+
+# Tooling
 .DS_Store
 *.log
 .idea/
+.vscode/
