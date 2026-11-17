@@ -1,0 +1,279 @@
+---
+title: Best — Getting Started
+date: 2026-11-17
+status: draft
+owner: research
+tags: [setup, bun, quickstart]
+---
+
+# Getting Started
+
+Requirements: **Bun >= 1.4.0**. Nothing else — no Node.js, no Deno, no native build step.
+
+```bash
+bun --version
+```
+
+---
+
+## 1. Install
+
+```bash
+bun add best
+```
+
+To work on Best itself:
+
+```bash
+git clone https://github.com/lendradev/best.git
+cd best/workspace
+bun install
+bun test
+```
+
+---
+
+## 2. Scaffold a project
+
+```bash
+bunx best new my-api
+cd my-api
+bun install
+bun run dev
+```
+
+The scaffold produces:
+
+```
+my-api/
+├── package.json
+├── tsconfig.json
+├── .gitignore
+└── src/
+    ├── main.ts
+    └── models/user.ts
+```
+
+`src/main.ts` starts a server on port 3000 (override with `PORT`).
+
+---
+
+## 3. A minimal application
+
+```ts
+import { Controller, Get, Module, createApp } from 'best';
+
+@Controller('/')
+class AppController {
+  @Get('/')
+  root() {
+    return { status: 'ok' };
+  }
+}
+
+@Module({ controllers: [AppController] })
+class AppModule {}
+
+const { listen } = createApp([AppModule]);
+const server = await listen({ port: 3000 });
+console.log(`Listening on ${server.url}`);
+```
+
+---
+
+## 4. Dependency injection
+
+Bun does not implement `emitDecoratorMetadata`, so every dependency names its
+token with `@Inject`:
+
+```ts
+import { Inject, Injectable } from 'best';
+
+@Injectable()
+export class UserService {
+  constructor(@Inject(UserRepository) private readonly repo: UserRepository) {}
+}
+```
+
+Providers are registered per module:
+
+```ts
+@Module({
+  controllers: [UserController],
+  providers: [UserService, UserRepository, { provide: 'CONFIG', useValue: { ttl: 60 } }],
+})
+export class UserModule {}
+```
+
+Provider forms: a class, `{ provide, useValue }`, `{ provide, useClass }`,
+`{ provide, useFactory, inject }`.
+
+Scopes: `singleton` (default), `transient`, `request`.
+
+```ts
+@Injectable({ scope: 'request' })
+export class RequestContext {}
+```
+
+---
+
+## 5. Routing and parameters
+
+```ts
+@Controller('/users')
+export class UserController {
+  @Get('/')                       list() { /* ... */ }
+  @Get('/:id')                    find(@Param('id') id: string) { /* ... */ }
+  @Get('/search')                 search(@Query('q') q: string) { /* ... */ }
+  @Post('/')                      create(@Body() body: unknown) { /* ... */ }
+  @Delete('/:id')                 remove(@Param('id') id: string) { /* ... */ }
+}
+```
+
+Path patterns: `:param`, `:param?` for optional segments, `*` for a wildcard
+tail. `@HttpCode(202)` overrides the default status (200, or 201 for `POST`).
+
+---
+
+## 6. Validation
+
+```ts
+import { BodyPiped, ValidationPipe } from 'best';
+
+@Post('/')
+create(
+  @BodyPiped(new ValidationPipe({
+    email: { type: 'email', required: true },
+    age: { type: 'integer', min: 0 },
+  }))
+  body: { email: string; age?: number },
+) {
+  /* ... */
+}
+```
+
+A failed rule throws `BadRequestException` (HTTP 400) with a message naming
+the field.
+
+---
+
+## 7. Guards, interceptors and filters
+
+```ts
+import { CanActivate, ExceptionFilter, ExecutionContext, NestInterceptor, UseGuards } from 'best';
+
+@Injectable()
+export class AuthGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    return context.headers.get('authorization') === 'Bearer secret';
+  }
+}
+
+@Injectable()
+export class TimingInterceptor implements NestInterceptor {
+  async intercept(_context: ExecutionContext, next: () => Promise<unknown>) {
+    const started = performance.now();
+    const result = await next();
+    console.log(`took ${performance.now() - started}ms`);
+    return result;
+  }
+}
+```
+
+Apply them at class or method level:
+
+```ts
+@Controller('/admin')
+@UseGuards(AuthGuard)
+export class AdminController {
+  @Get('/stats')
+  @UseInterceptors(TimingInterceptor)
+  stats() { /* ... */ }
+}
+```
+
+Guards returning `false` produce a `403`. Throwing `HttpException` subclasses
+(`BadRequestException`, `NotFoundException`, `ConflictException`, …) maps
+directly to the response status.
+
+---
+
+## 8. The ORM
+
+```ts
+import { Database } from 'best/orm';
+import { id, integer, table, text } from 'best/orm';
+
+export const users = table('users', [
+  id(),
+  text('email', { notNull: true, unique: true }),
+  text('name', { notNull: true }),
+  integer('age'),
+]);
+
+const db = new Database(new SqliteDriver({ file: 'app.db' }));
+
+for (const statement of generateMigration({ tables: [users] }).statements) {
+  await db.executeRun(statement);
+}
+
+const user = db.model({ name: 'user', table: users });
+
+await user.create({ data: { email: 'ada@example.com', name: 'Ada', age: 36 } });
+await user.findMany({ where: { age: { gte: 18 } }, orderBy: { column: 'name' } });
+await user.aggregate({ _count: true, _avg: { age: true } });
+await db.transaction(async (tx) => {
+  await tx.model({ name: 'user', table: users }).delete({ where: { id: 1 } });
+});
+```
+
+Postgres uses the same client with a different driver:
+
+```ts
+const db = new Database(new PostgresDriver({ url: process.env.DATABASE_URL! }));
+```
+
+---
+
+## 9. Migrations from the CLI
+
+```bash
+best migrate src/schema.ts --db app.db
+```
+
+The schema file must export a `schema` object:
+
+```ts
+import { SchemaBuilder } from 'best/orm';
+
+export const schema = new SchemaBuilder()
+  .table('users', [id(), text('email', { notNull: true })])
+  .build();
+```
+
+---
+
+## 10. Testing
+
+```ts
+import { describe, expect, test } from 'bun:test';
+import { createTestingModule } from 'best/testing';
+
+const module = await createTestingModule({ providers: [UserService] });
+const service = module.get(UserService);
+await module.close();
+```
+
+The framework's own suite runs with `bun test`.
+
+---
+
+## 11. Commands
+
+| Command | Description |
+|---|---|
+| `best new <name>` | Scaffold a project |
+| `best generate <model>` | Create a model file from the template |
+| `best migrate <schema.ts>` | Apply schema DDL to SQLite |
+| `best dev` | Run `src/main.ts` with hot reload |
+| `best start` | Run `src/main.ts` |

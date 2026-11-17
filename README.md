@@ -90,7 +90,7 @@ Also included: guards, interceptors, exception filters, lifecycle hooks, a
 
 ```ts
 import { Database, SqliteDriver } from 'best/orm';
-import { id, integer, table, text } from 'best/orm/schema';
+import { id, integer, table, text } from 'best/orm';
 
 export const users = table('users', [
   id(),
@@ -121,10 +121,13 @@ bun run src/cli/main.ts dev
 
 ## Documentation
 
-- Architecture: [`../docs/architecture.md`](../docs/architecture.md)
-- API reference: [`../docs/api.md`](../docs/api.md)
-- Getting started: [`../docs/getting-started.md`](../docs/getting-started.md)
+The full API reference, architecture notes and setup guide are maintained
+alongside the source in this repository's `docs/` folder.
+
+- [Getting started](docs/getting-started.md) — install, scaffold, DI, routing, validation, ORM, migrations
+- [Architecture](docs/architecture.md) — layer map, design decisions, known limitations
+- [API reference](docs/api.md) — every export of `best`, `best/orm` and `best/testing`
 
 ## License
 
-MIT
+[MIT](LICENSE)
