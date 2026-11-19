@@ -22,8 +22,38 @@ export type {
   WhereValue,
 } from './client.ts';
 
-export { createDriver, PostgresDriver, SqliteDriver } from './driver.ts';
-export type { Driver, PostgresDriverOptions, SqliteDriverOptions } from './driver.ts';
+export {
+  createDriver,
+  inferAdapter,
+  MariadbDriver,
+  MysqlDriver,
+  PostgresDriver,
+  SqliteDriver,
+} from './driver.ts';
+export type {
+  Driver,
+  DriverOptions,
+  SqlDriverOptions,
+  SqliteDriverOptions,
+} from './driver.ts';
+
+export {
+  getDialect,
+  mariadbDialect,
+  mysqlDialect,
+  postgresDialect,
+  sqliteDialect,
+} from './dialect.ts';
+export type { Dialect, DialectName, UpsertOptions } from './dialect.ts';
+
+export {
+  countNumberedPlaceholders,
+  countPlaceholders,
+  numberPlaceholders,
+  renderSql,
+  replacePlaceholders,
+} from './render.ts';
+export type { RenderedSql } from './render.ts';
 
 export {
   DeleteBuilder,
@@ -31,7 +61,7 @@ export {
   SelectBuilder,
   UpdateBuilder,
 } from './query-builder.ts';
-export type { JoinSpec, OrderBy, SelectOptions } from './query-builder.ts';
+export type { JoinSpec, OrderBy, OrderDirection, Quote, SelectOptions } from './query-builder.ts';
 
 export {
   SQL,

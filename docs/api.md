@@ -295,7 +295,13 @@ construction.
 ```ts
 const db = new Database(new SqliteDriver({ file: 'app.db' }));
 const db = new Database(new PostgresDriver({ url: 'postgres://…' }));
+const db = new Database(new MysqlDriver({ url: 'mysql://…' }));
+const db = new Database(new MariadbDriver({ url: 'mariadb://…' }));
 ```
+
+The shorthand constructors pick the backend for you: `Database.sqlite(options?)`,
+`Database.postgres(options)`, `Database.mysql(options)` and
+`Database.mariadb(options)`.
 
 | Member | Description |
 |---|---|
@@ -306,6 +312,49 @@ const db = new Database(new PostgresDriver({ url: 'postgres://…' }));
 | `transaction(fn)` | Run `fn` inside a transaction with a transactional database handle |
 | `close()` | Close the driver |
 | `driver` | The underlying driver |
+| `dialect` | The dialect the database speaks |
+| `dialectName` | The name of that dialect: `sqlite`, `postgres`, `mysql` or `mariadb` |
+
+### Drivers
+
+| Driver | Backend | Options |
+|---|---|---|
+| `SqliteDriver` | SQLite, through `bun:sqlite` | `file`, `readonly`, `create`, `strict`, `safeIntegers` |
+| `PostgresDriver` | PostgreSQL, through `Bun.SQL` | `url`, `max`, `tls` |
+| `MysqlDriver` | MySQL, through `Bun.SQL` | `url`, `max`, `tls`, `allowPublicKeyRetrieval` |
+| `MariadbDriver` | MariaDB, through `Bun.SQL` | `url`, `max`, `tls` |
+
+`createDriver(options)` picks a driver from the connection URL scheme.
+`inferAdapter(url)` returns the adapter name for a URL.
+
+`allowPublicKeyRetrieval` is off by default. MySQL 8 accounts that use
+`caching_sha2_password` need it over an unencrypted connection; enable it only
+for a server you trust.
+
+### Dialects
+
+A dialect describes what differs between the backends: placeholders,
+identifier quoting, `RETURNING` support, upsert syntax, boolean storage,
+case-insensitive matching, column types, default values and table DDL.
+
+| Export | Description |
+|---|---|
+| `getDialect(name)` | The dialect for a name |
+| `sqliteDialect`, `postgresDialect`, `mysqlDialect`, `mariadbDialect` | The four dialects |
+
+### Rendering
+
+| Export | Description |
+|---|---|
+| `renderSql(sql, params, dialect)` | Rewrite portable `?` placeholders to the dialect syntax |
+| `numberPlaceholders(sql)` | Number the `?` placeholders as `$1`, `$2` |
+| `replacePlaceholders(sql, placeholder)` | Replace the `?` placeholders with a function |
+| `countPlaceholders(sql)` | Count the `?` placeholders |
+| `countNumberedPlaceholders(sql)` | Count the `$n` placeholders |
+
+A statement that already uses `$n` is left alone, so hand-written PostgreSQL
+keeps working. Mixing `?` and `$n` in one statement is an error, and so is a
+placeholder count that does not match the number of bound parameters.
 
 ### Model delegate
 
@@ -328,6 +377,9 @@ aggregate({ where, _count, _sum, _avg, _min, _max })
 Where operators: `equals`, `not`, `in`, `notIn`, `gt`, `gte`, `lt`, `lte`,
 `contains`, `startsWith`, `endsWith`, `isNull`, `notNull`.
 
+A `boolean` column round-trips as a boolean on every backend, whatever the
+backend stores it as.
+
 ### Schema
 
 `table(name, columns, options?)`, `column(name, type, options?)`, `id()`,
@@ -343,9 +395,15 @@ Where operators: `equals`, `not`, `in`, `notIn`, `gt`, `gte`, `lt`, `lte`,
 
 ### Migrations
 
-`generateMigration(schema, name?)` returns `{ name, statements }`.
+`generateMigration(schema, name?, dialect?)` returns `{ name, statements }`.
+The dialect defaults to `sqlite`; pass `postgres`, `mysql` or `mariadb` to
+render the DDL for another backend.
+
 `diffSchema(schema, driver)` returns `{ createTables, addColumns, manual }`.
-`createTableSql(table)` renders a single `CREATE TABLE` statement.
+
+`createTableSql(table, dialect?)` renders a single `CREATE TABLE` statement.
+`createIndexSql(table, dialect?)` renders the index statements.
+`formatDefault(value, dialect?)` renders a default value as a SQL literal.
 
 ### Errors
 

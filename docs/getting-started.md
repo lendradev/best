@@ -233,6 +233,28 @@ Postgres uses the same client with a different driver:
 const db = new Database(new PostgresDriver({ url: process.env.DATABASE_URL! }));
 ```
 
+MySQL and MariaDB work the same way:
+
+```ts
+const db = new Database(new MysqlDriver({ url: process.env.DATABASE_URL! }));
+const db = new Database(new MariadbDriver({ url: process.env.DATABASE_URL! }));
+```
+
+The same model and the same calls work on every backend. The dialect takes
+care of the differences: the placeholder syntax, the quoting, the upsert
+syntax and how a boolean is stored. A `boolean` column reads back as a
+boolean on every backend.
+
+MySQL 8 accounts that use `caching_sha2_password` need the server's RSA key
+over an unencrypted connection. Turn `allowPublicKeyRetrieval` on for a server
+you trust:
+
+```ts
+const db = new Database(
+  new MysqlDriver({ url: process.env.DATABASE_URL!, allowPublicKeyRetrieval: true }),
+);
+```
+
 ---
 
 ## 9. Migrations from the CLI

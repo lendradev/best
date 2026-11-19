@@ -192,21 +192,51 @@ Every builder exposes `toSQL()` returning `{ sql, params }`, so the generated
 statement is inspectable — the Drizzle property — while the call sites keep the
 Prisma shape.
 
-### 3.4 Drivers
+### 3.4 Drivers and dialects
 
-`SqliteDriver` wraps `bun:sqlite` (synchronous). `PostgresDriver` wraps
-`Bun.SQL` (asynchronous, pooled). Both implement the same `Driver` interface:
-`all`, `get`, `run`, `transaction`, `close`.
+`SqliteDriver` wraps `bun:sqlite` (synchronous). `PostgresDriver`,
+`MysqlDriver` and `MariadbDriver` wrap `Bun.SQL` (asynchronous, pooled). All
+implement the same `Driver` interface: `all`, `get`, `run`, `transaction`,
+`close`.
 
-`RETURNING` is used for `create`, `update` and `delete` so the affected row
-comes back in a single round trip.
+The differences between the backends live in a `Dialect` object rather than
+in the query layer. A dialect owns:
+
+- the parameter placeholder (`?` or `$1`),
+- identifier quoting,
+- whether `RETURNING` is available,
+- the upsert syntax (`ON CONFLICT` or `ON DUPLICATE KEY UPDATE`),
+- how a boolean is stored and how a case-insensitive match is spelled,
+- the column types, the default values and the table DDL.
+
+The query layer writes portable SQL with `?` placeholders, and the driver
+renders it to the dialect of the backend. Identifiers are quoted on the way
+out, because PostgreSQL folds an unquoted `userId` to `userid` and the column
+does not exist under that name.
+
+`RETURNING` is used for `create`, `update` and `delete` where the backend
+supports it, so the affected row comes back in a single round trip. MySQL has
+no `RETURNING`; the row is read back by its primary key instead.
+
+Two backends behave differently enough to need their own handling:
+
+- **Booleans.** PostgreSQL stores a real boolean, SQLite and MySQL store an
+  integer. The model delegate encodes a boolean on write and decodes it on
+  read, using the column type from the schema, so a `boolean` column
+  round-trips as a boolean everywhere.
+- **Row counts.** MySQL and MariaDB count the rows that *changed*, not the
+  rows that *matched*, so an update that writes the same values reports zero.
+  The ORM counts the matching rows itself, and an update decides whether a
+  row exists by reading it back rather than by trusting the count.
 
 ### 3.5 Migrations
 
-`generateMigration(schema)` produces DDL statements. `diffSchema(schema, driver)`
-introspects a live SQLite database and reports tables to create and columns to
-add. Statements that cannot be applied automatically are returned under
-`manual` rather than attempted.
+`generateMigration(schema, name, dialect)` produces DDL statements for the
+given backend. `diffSchema(schema, driver)` introspects a live database and
+reports tables to create and columns to add. It reads `sqlite_master` for
+SQLite, `information_schema` for PostgreSQL and `INFORMATION_SCHEMA` for
+MySQL and MariaDB. Statements that cannot be applied automatically are
+returned under `manual` rather than attempted.
 
 ### 3.6 Not yet implemented
 
@@ -215,7 +245,6 @@ as follow-up work:
 
 - Relation loading (`include` / `select` on relation fields) and nested writes.
 - `groupBy`.
-- Postgres migration diffing (only SQLite introspection is implemented).
 - `Prisma Studio` equivalent GUI.
 
 ---
@@ -229,7 +258,9 @@ as follow-up work:
 | No `reflect-metadata` | Bun has no metadata reflection | Hand-written metadata store (~60 lines) |
 | `Bun.write` / `Bun.file` instead of `node:fs` | Keeps the runtime surface Bun-only | No `mkdir` primitive; `Bun.write` creates parents |
 | SQL builders over a query compiler | Inspectable SQL, no engine, Drizzle-level speed | Less automatic relation handling |
-| `RETURNING` for writes | One round trip per write | Requires SQLite >= 3.35 / Postgres >= 8.2 |
+| A dialect object per backend | One query layer for four backends, no `if (postgres)` in the code | A new backend means a new dialect |
+| Portable `?` placeholders, rendered by the driver | The query layer never branches on the backend | A hand-written statement has to use `?`, not `$1` |
+| `RETURNING` for writes where the backend has it | One round trip per write | MySQL needs a read-back; PostgreSQL needs >= 8.2 |
 
 ---
 
@@ -246,6 +277,12 @@ as follow-up work:
    and the `MiddlewareConsumer` concept from Nest are not wired into the
    request pipeline yet.
 5. **No WebSocket, GraphQL, microservice or OpenAPI support.**
+6. **MySQL and MariaDB count the rows that changed.** The ORM compensates by
+   counting the matching rows itself, which costs one extra query on
+   `updateMany` and `deleteMany` for those two backends. Bun 1.4.0 has no
+   support for the `foundRows` option that would avoid it.
+7. **A raw statement uses `?` for its parameters.** A hand-written PostgreSQL
+   statement may use `$1`, but the two styles cannot be mixed.
 
 ---
 

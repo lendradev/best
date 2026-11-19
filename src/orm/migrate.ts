@@ -2,9 +2,10 @@
  * Schema-to-SQL migration generator.
  *
  * Reads a `SchemaDefinition` and produces DDL statements per table, plus
- * index creation. Introspects an existing SQLite database to compute a diff.
+ * index creation. Introspects an existing database to compute a diff.
  */
 
+import { getDialect, type Dialect, type DialectName } from './dialect.ts';
 import type { Driver } from './driver.ts';
 import type { ColumnDefinition, SchemaDefinition, TableDefinition } from './schema.ts';
 
@@ -13,86 +14,49 @@ export interface Migration {
   statements: string[];
 }
 
-export type SqlType =
-  | 'TEXT'
-  | 'INTEGER'
-  | 'REAL'
-  | 'BLOB'
-  | 'BOOLEAN'
-  | 'JSON'
-  | 'TIMESTAMP'
-  | 'BIGINT';
-
-const TYPE_MAP: Record<ColumnDefinition['type'], SqlType> = {
-  text: 'TEXT',
-  integer: 'INTEGER',
-  real: 'REAL',
-  boolean: 'BOOLEAN',
-  blob: 'BLOB',
-  json: 'JSON',
-  timestamp: 'TIMESTAMP',
-  uuid: 'TEXT',
-  bigint: 'BIGINT',
-};
-
-function quote(identifier: string): string {
-  return `"${identifier.replace(/"/g, '""')}"`;
+/**
+ * Renders a default value as a SQL literal.
+ *
+ * The dialect decides how a boolean default is spelled, so this uses the
+ * SQLite spelling unless another dialect is given.
+ */
+export function formatDefault(value: unknown, dialect: Dialect = getDialect('sqlite')): string | null {
+  return dialect.defaultValue(value);
 }
 
-export function formatDefault(value: unknown): string | null {
-  if (value === undefined) return null;
-  if (value === null) return 'NULL';
-  if (typeof value === 'boolean') return value ? '1' : '0';
-  if (typeof value === 'number') return String(value);
-  if (typeof value === 'string') return `'${value.replace(/'/g, "''")}'`;
-  return `'${JSON.stringify(value).replace(/'/g, "''")}'`;
+/**
+ * DDL for one table, rendered with the dialect's quoting and types.
+ *
+ * The dialect owns table and index creation; this is the public entry point.
+ */
+export function createTableSql(table: TableDefinition, dialect: Dialect = getDialect('sqlite')): string {
+  return dialect.createTable(table)[0] ?? '';
 }
 
-export function createTableSql(table: TableDefinition): string {
-  const parts: string[] = [];
-
-  for (const column of table.columns) {
-    let definition = `${quote(column.name)} ${TYPE_MAP[column.type]}`;
-    if (column.primaryKey) {
-      definition += column.autoIncrement ? ' PRIMARY KEY AUTOINCREMENT' : ' PRIMARY KEY';
-    }
-    if (column.notNull && !column.primaryKey) definition += ' NOT NULL';
-    if (column.unique && !column.primaryKey) definition += ' UNIQUE';
-    const defaultValue = formatDefault(column.default);
-    if (defaultValue !== null) definition += ` DEFAULT ${defaultValue}`;
-    parts.push(definition);
-  }
-
-  for (const column of table.columns) {
-    if (!column.references) continue;
-    const action = column.references.onDelete ? ` ON DELETE ${column.references.onDelete}` : '';
-    parts.push(
-      `FOREIGN KEY (${quote(column.name)}) REFERENCES ${quote(column.references.table)}(${quote(column.references.column)})${action}`,
-    );
-  }
-
-  return `CREATE TABLE IF NOT EXISTS ${quote(table.name)} (\n  ${parts.join(',\n  ')}\n)`;
-}
-
-export function createIndexSql(table: TableDefinition): string[] {
-  return table.indexes.map(
-    (index) =>
-      `CREATE ${index.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS ${quote(index.name)} ON ${quote(table.name)} (${index.columns.map(quote).join(', ')})`,
-  );
+/** Index DDL for one table. */
+export function createIndexSql(
+  table: TableDefinition,
+  dialect: Dialect = getDialect('sqlite'),
+): string[] {
+  return dialect.createTable(table).slice(1);
 }
 
 /** Full DDL for a schema — used to create a fresh database. */
-export function generateMigration(schema: SchemaDefinition, name = 'initial'): Migration {
+export function generateMigration(
+  schema: SchemaDefinition,
+  name = 'initial',
+  dialectName: DialectName = 'sqlite',
+): Migration {
+  const dialect = getDialect(dialectName);
   const statements: string[] = [];
   for (const table of schema.tables) {
-    statements.push(createTableSql(table));
-    statements.push(...createIndexSql(table));
+    statements.push(...dialect.createTable(table));
   }
   return { name, statements };
 }
 
 /* -------------------------------------------------------------------------- */
-/* Diffing against a live SQLite database                                     */
+/* Diffing against a live database                                            */
 /* -------------------------------------------------------------------------- */
 
 export interface ExistingColumn {
@@ -115,12 +79,29 @@ export async function diffSchema(
   driver: Driver,
 ): Promise<SchemaDiff> {
   const diff: SchemaDiff = { createTables: [], addColumns: [], manual: [] };
+  const dialect = getDialect(driver.kind);
 
-  if (driver.kind !== 'sqlite') {
-    diff.manual.push('Schema diffing is only implemented for SQLite drivers.');
+  if (dialect.name === 'sqlite') {
+    await diffSqlite(schema, driver, diff, dialect);
     return diff;
   }
 
+  if (dialect.name === 'postgres') {
+    await diffPostgres(schema, driver, diff, dialect);
+    return diff;
+  }
+
+  // MySQL and MariaDB share the INFORMATION_SCHEMA layout.
+  await diffMySqlFamily(schema, driver, diff, dialect);
+  return diff;
+}
+
+async function diffSqlite(
+  schema: SchemaDefinition,
+  driver: Driver,
+  diff: SchemaDiff,
+  dialect: Dialect,
+): Promise<void> {
   const existingTables = new Set(
     (await driver.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type='table'`)).map(
       (row) => row.name,
@@ -129,30 +110,109 @@ export async function diffSchema(
 
   for (const table of schema.tables) {
     if (!existingTables.has(table.name)) {
-      diff.createTables.push(createTableSql(table));
-      diff.createTables.push(...createIndexSql(table));
+      diff.createTables.push(...dialect.createTable(table));
       continue;
     }
 
     const existingColumns = new Map(
-      (await driver.all<ExistingColumn>(`PRAGMA table_info(${quote(table.name)})`)).map((column) => [
-        column.name,
-        column,
-      ]),
+      (await driver.all<ExistingColumn>(`PRAGMA table_info(${dialect.quote(table.name)})`)).map(
+        (column) => [column.name, column],
+      ),
     );
 
     for (const column of table.columns) {
       if (existingColumns.has(column.name)) continue;
-      let definition = `${quote(column.name)} ${TYPE_MAP[column.type]}`;
-      if (column.notNull) definition += ' NOT NULL';
-      const defaultValue = formatDefault(column.default);
-      if (defaultValue !== null) definition += ` DEFAULT ${defaultValue}`;
       diff.addColumns.push({
         table: table.name,
-        sql: `ALTER TABLE ${quote(table.name)} ADD COLUMN ${definition}`,
+        sql: `ALTER TABLE ${dialect.quote(table.name)} ADD COLUMN ${addColumnSql(column, dialect)}`,
       });
     }
   }
+}
 
-  return diff;
+async function diffPostgres(
+  schema: SchemaDefinition,
+  driver: Driver,
+  diff: SchemaDiff,
+  dialect: Dialect,
+): Promise<void> {
+  const existingTables = new Set(
+    (
+      await driver.all<{ table_name: string }>(
+        `SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()`,
+      )
+    ).map((row) => row.table_name),
+  );
+
+  for (const table of schema.tables) {
+    if (!existingTables.has(table.name)) {
+      diff.createTables.push(...dialect.createTable(table));
+      continue;
+    }
+
+    const existingColumns = new Set(
+      (
+        await driver.all<{ column_name: string }>(
+          `SELECT column_name FROM information_schema.columns WHERE table_name = ? AND table_schema = current_schema()`,
+          [table.name],
+        )
+      ).map((row) => row.column_name),
+    );
+
+    for (const column of table.columns) {
+      if (existingColumns.has(column.name)) continue;
+      diff.addColumns.push({
+        table: table.name,
+        sql: `ALTER TABLE ${dialect.quote(table.name)} ADD COLUMN ${addColumnSql(column, dialect)}`,
+      });
+    }
+  }
+}
+
+async function diffMySqlFamily(
+  schema: SchemaDefinition,
+  driver: Driver,
+  diff: SchemaDiff,
+  dialect: Dialect,
+): Promise<void> {
+  const existingTables = new Set(
+    (
+      await driver.all<{ TABLE_NAME: string }>(
+        `SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE()`,
+      )
+    ).map((row) => row.TABLE_NAME),
+  );
+
+  for (const table of schema.tables) {
+    if (!existingTables.has(table.name)) {
+      diff.createTables.push(...dialect.createTable(table));
+      continue;
+    }
+
+    const existingColumns = new Set(
+      (
+        await driver.all<{ COLUMN_NAME: string }>(
+          `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+          [table.name],
+        )
+      ).map((row) => row.COLUMN_NAME),
+    );
+
+    for (const column of table.columns) {
+      if (existingColumns.has(column.name)) continue;
+      diff.addColumns.push({
+        table: table.name,
+        sql: `ALTER TABLE ${dialect.quote(table.name)} ADD COLUMN ${addColumnSql(column, dialect)}`,
+      });
+    }
+  }
+}
+
+/** Column definition used in an `ALTER TABLE ... ADD COLUMN` statement. */
+function addColumnSql(column: ColumnDefinition, dialect: Dialect): string {
+  let definition = `${dialect.quote(column.name)} ${dialect.columnType(column.type)}`;
+  if (column.notNull) definition += ' NOT NULL';
+  const defaultValue = dialect.defaultValue(column.default);
+  if (defaultValue !== null) definition += ` DEFAULT ${defaultValue}`;
+  return definition;
 }

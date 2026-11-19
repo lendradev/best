@@ -3,15 +3,26 @@
  *
  * `db.user.findMany({ where: { email: { contains: 'x' } } })` compiles to a
  * parameterized SQL statement and executes it on the configured driver.
+ *
+ * Statements are written with portable `?` placeholders and portable
+ * identifiers; the driver renders both to the dialect of the backend.
  */
 
-import { SqliteDriver, type Driver } from './driver.ts';
+import {
+  MariadbDriver,
+  MysqlDriver,
+  PostgresDriver,
+  SqliteDriver,
+  type Driver,
+} from './driver.ts';
+import { getDialect, type Dialect, type DialectName } from './dialect.ts';
 import {
   DeleteBuilder,
   InsertBuilder,
   SelectBuilder,
   UpdateBuilder,
   type OrderBy,
+  type Quote,
 } from './query-builder.ts';
 import {
   SQL,
@@ -22,7 +33,6 @@ import {
   inArray,
   isNotNull,
   isNull,
-  like,
   lt,
   lte,
   ne,
@@ -146,23 +156,29 @@ export interface ModelDefinition {
 /* Where compiler                                                             */
 /* -------------------------------------------------------------------------- */
 
-function compileValue(column: string, value: unknown): SQL {
+/**
+ * Compiles a value for comparison.
+ *
+ * A boolean is stored the way the backend stores it: `TRUE` on PostgreSQL,
+ * `1` on the backends that keep a boolean in an integer column.
+ */
+function compileValue(column: string, value: unknown, dialect: Dialect): SQL {
   if (value === null) return isNull(column);
   if (value instanceof Date) return eq(column, value.toISOString());
-  if (typeof value === 'boolean') return eq(column, value ? 1 : 0);
+  if (typeof value === 'boolean') return eq(column, dialect.toStorage(value));
   return eq(column, value);
 }
 
-function compileCondition(column: string, value: WhereValue): SQL | undefined {
+function compileCondition(column: string, value: WhereValue, dialect: Dialect): SQL | undefined {
   if (value === null) return isNull(column);
   if (typeof value !== 'object' || value instanceof Date || value instanceof Uint8Array) {
-    return compileValue(column, value);
+    return compileValue(column, value, dialect);
   }
 
   const conditions: SQL[] = [];
   const spec = value as WhereOperators;
 
-  if ('equals' in spec) conditions.push(compileValue(column, spec.equals));
+  if ('equals' in spec) conditions.push(compileValue(column, spec.equals, dialect));
   if ('not' in spec) {
     const notValue = spec.not;
     conditions.push(notValue === null ? isNotNull(column) : ne(column, notValue));
@@ -173,9 +189,9 @@ function compileCondition(column: string, value: WhereValue): SQL | undefined {
   if ('gte' in spec) conditions.push(gte(column, spec.gte));
   if ('lt' in spec) conditions.push(lt(column, spec.lt));
   if ('lte' in spec) conditions.push(lte(column, spec.lte));
-  if ('contains' in spec) conditions.push(like(column, `%${spec.contains}%`));
-  if ('startsWith' in spec) conditions.push(like(column, `${spec.startsWith}%`));
-  if ('endsWith' in spec) conditions.push(like(column, `%${spec.endsWith}`));
+  if ('contains' in spec) conditions.push(ilike(column, `%${spec.contains}%`, dialect));
+  if ('startsWith' in spec) conditions.push(ilike(column, `${spec.startsWith}%`, dialect));
+  if ('endsWith' in spec) conditions.push(ilike(column, `%${spec.endsWith}`, dialect));
   if (spec.isNull === true) conditions.push(isNull(column));
   if (spec.notNull === true) conditions.push(isNotNull(column));
 
@@ -183,11 +199,27 @@ function compileCondition(column: string, value: WhereValue): SQL | undefined {
   return and(...conditions);
 }
 
-export function compileWhere(where: WhereInput | undefined): SQL | undefined {
+/**
+ * Case-insensitive match. PostgreSQL has `ILIKE`; MySQL, MariaDB and SQLite
+ * need `LOWER(column) LIKE LOWER(?)`.
+ */
+function ilike(column: string, pattern: string, dialect: Dialect): SQL {
+  return SQL.raw(dialect.ilike(column), [pattern]);
+}
+
+/**
+ * Compiles a where clause.
+ *
+ * The column names are quoted with the dialect's rules, so a column such as
+ * `userId` keeps its case on PostgreSQL, which folds unquoted identifiers to
+ * lower case.
+ */
+export function compileWhere(where: WhereInput | undefined, dialect?: Dialect): SQL | undefined {
   if (!where) return undefined;
+  const effective = dialect ?? getDialect('sqlite');
   const conditions: SQL[] = [];
   for (const [column, value] of Object.entries(where)) {
-    const compiled = compileCondition(column, value);
+    const compiled = compileCondition(effective.quote(column), value, effective);
     if (compiled) conditions.push(compiled);
   }
   if (conditions.length === 0) return undefined;
@@ -226,13 +258,15 @@ export class ModelDelegate<T = Record<string, unknown>> {
     const builder = new SelectBuilder({
       table: this.#model.table.name,
       columns: args.select,
-      where: compileWhere(args.where),
+      where: compileWhere(args.where, this.#db.dialect),
       orderBy: normalizeOrderBy(args.orderBy),
       limit: args.take,
       offset: args.skip,
+      quote: this.#db.dialect.quote,
     });
     const { sql, params } = builder.toSQL();
-    return this.#db.executeAll<T>(sql, params);
+    const rows = await this.#db.executeAll<Record<string, unknown>>(sql, params);
+    return rows.map((row) => this.#decode(row)) as T[];
   }
 
   async findFirst(args: FindFirstArgs = {}): Promise<T | null> {
@@ -250,11 +284,13 @@ export class ModelDelegate<T = Record<string, unknown>> {
     const builder = new SelectBuilder({
       table: this.#model.table.name,
       columns: args.select,
-      where: compileWhere(args.where),
+      where: compileWhere(args.where, this.#db.dialect),
       limit: 1,
+      quote: this.#db.dialect.quote,
     });
     const { sql, params } = builder.toSQL();
-    return this.#db.executeOne<T>(sql, params);
+    const row = await this.#db.executeOne<Record<string, unknown>>(sql, params);
+    return row ? (this.#decode(row) as T) : null;
   }
 
   async findUniqueOrThrow(args: FindUniqueArgs): Promise<T> {
@@ -264,19 +300,23 @@ export class ModelDelegate<T = Record<string, unknown>> {
   }
 
   async count(args: CountArgs = {}): Promise<number> {
-    const where = compileWhere(args.where);
+    const where = compileWhere(args.where, this.#db.dialect);
+    const table = this.#db.dialect.quote(this.#model.table.name);
+    const alias = this.#db.dialect.quote('count');
     const sql = where
-      ? `SELECT COUNT(*) as count FROM ${this.#model.table.name} WHERE ${where.toFragment().sql}`
-      : `SELECT COUNT(*) as count FROM ${this.#model.table.name}`;
+      ? `SELECT COUNT(*) as ${alias} FROM ${table} WHERE ${where.toFragment().sql}`
+      : `SELECT COUNT(*) as ${alias} FROM ${table}`;
     const params = where ? where.toFragment().params : [];
     const row = await this.#db.executeOne<{ count: number }>(sql, params);
     return Number(row?.count ?? 0);
   }
 
   async aggregate(args: AggregateArgs = {}): Promise<AggregateResult> {
-    const where = compileWhere(args.where);
+    const where = compileWhere(args.where, this.#db.dialect);
     const whereSql = where ? ` WHERE ${where.toFragment().sql}` : '';
     const whereParams = where ? where.toFragment().params : [];
+    const table = this.#db.dialect.quote(this.#model.table.name);
+    const quote = this.#db.dialect.quote;
 
     const result: AggregateResult = {
       _count: 0,
@@ -287,7 +327,7 @@ export class ModelDelegate<T = Record<string, unknown>> {
     };
 
     const countRow = await this.#db.executeOne<{ count: number }>(
-      `SELECT COUNT(*) as count FROM ${this.#model.table.name}${whereSql}`,
+      `SELECT COUNT(*) as ${quote('count')} FROM ${table}${whereSql}`,
       whereParams,
     );
     result._count = Number(countRow?.count ?? 0);
@@ -298,10 +338,10 @@ export class ModelDelegate<T = Record<string, unknown>> {
     ) => {
       if (!columns) return;
       const selected = Object.keys(columns)
-        .map((c) => `${fn}(${c}) as ${c}`)
+        .map((c) => `${fn}(${quote(c)}) as ${quote(c)}`)
         .join(', ');
       const row = await this.#db.executeOne<Record<string, number | null>>(
-        `SELECT ${selected} FROM ${this.#model.table.name}${whereSql}`,
+        `SELECT ${selected} FROM ${table}${whereSql}`,
         whereParams,
       );
       const bucket = result[`_${fn.toLowerCase()}` as '_sum' | '_avg' | '_min' | '_max'];
@@ -322,78 +362,202 @@ export class ModelDelegate<T = Record<string, unknown>> {
   /* --------------------------------- write --------------------------------- */
 
   async create(args: CreateArgs): Promise<T> {
-    const builder = new InsertBuilder(this.#model.table.name, [args.data], args.select ?? ['*']);
-    const { sql, params } = builder.toSQL();
-    const rows = await this.#db.executeAll<T>(sql, params);
-    const row = rows[0];
-    if (row) return row;
-    // Drivers without RETURNING support need a follow-up read.
-    const primaryKey = this.#primaryKeyOf(args.data);
+    const dialect = this.#db.dialect;
+    const table = this.#model.table.name;
+    const data = this.#encode(args.data);
+
+    if (dialect.supportsReturning) {
+      const builder = new InsertBuilder(
+        table,
+        [data],
+        args.select ?? ['*'],
+        undefined,
+        dialect.quote,
+      );
+      const { sql, params } = builder.toSQL();
+      const rows = await this.#db.executeAll<Record<string, unknown>>(sql, params);
+      if (rows[0]) return this.#decode(rows[0]) as T;
+    } else {
+      // No RETURNING: insert, then read the row back by primary key.
+      const builder = new InsertBuilder(table, [data], [], undefined, dialect.quote);
+      const { sql, params } = builder.toSQL();
+      const result = await this.#db.executeRun(sql, params);
+
+      const primaryKey = this.#primaryKeyOf(data) ?? this.#generatedPrimaryKey(result);
+      if (primaryKey) {
+        const found = await this.findUnique({
+          where: { [primaryKey.name]: primaryKey.value } as WhereInput,
+          select: args.select,
+        });
+        if (found) return found;
+      }
+      return this.#decode(data) as T;
+    }
+
+    const primaryKey = this.#primaryKeyOf(data);
     if (primaryKey) {
-      const found = await this.findUnique({ where: { [primaryKey.name]: primaryKey.value } as WhereInput });
+      const found = await this.findUnique({
+        where: { [primaryKey.name]: primaryKey.value } as WhereInput,
+      });
       if (found) return found;
     }
-    return args.data as T;
+    return this.#decode(data) as T;
   }
 
   async createMany(args: CreateManyArgs): Promise<{ count: number }> {
     if (args.data.length === 0) return { count: 0 };
-    const builder = new InsertBuilder(this.#model.table.name, args.data);
+    const builder = new InsertBuilder(
+      this.#model.table.name,
+      args.data.map((data) => this.#encode(data)),
+      [],
+      undefined,
+      this.#db.dialect.quote,
+    );
     const { sql, params } = builder.toSQL();
     const result = await this.#db.executeRun(sql, params);
     return { count: result.changes };
   }
 
   async update(args: UpdateArgs): Promise<T> {
+    const dialect = this.#db.dialect;
+    const table = this.#model.table.name;
+    const data = this.#encode(args.data);
+
+    if (dialect.supportsReturningOnUpdate) {
+      const builder = new UpdateBuilder(
+        table,
+        data,
+        compileWhere(args.where, dialect),
+        args.select ?? ['*'],
+        dialect.quote,
+      );
+      const { sql, params } = builder.toSQL();
+      const rows = await this.#db.executeAll<Record<string, unknown>>(sql, params);
+      if (rows[0]) return this.#decode(rows[0]) as T;
+      throw new NotFoundError(this.#model.name);
+    }
+
+    // No RETURNING on UPDATE: update first, then read the row back.
     const builder = new UpdateBuilder(
-      this.#model.table.name,
-      args.data,
-      compileWhere(args.where),
-      args.select ?? ['*'],
+      table,
+      data,
+      compileWhere(args.where, dialect),
+      [],
+      dialect.quote,
     );
     const { sql, params } = builder.toSQL();
-    const rows = await this.#db.executeAll<T>(sql, params);
-    if (rows[0]) return rows[0];
+    await this.#db.executeRun(sql, params);
+
+    // The row count cannot decide whether the row exists: MySQL and MariaDB
+    // count the rows that changed, so an update that writes the same values
+    // reports zero for a row that is there.
+    const found = await this.findFirst({ where: args.where, select: args.select });
+    if (found) return found;
     throw new NotFoundError(this.#model.name);
   }
 
   async updateMany(args: UpdateManyArgs): Promise<{ count: number }> {
+    const dialect = this.#db.dialect;
     const builder = new UpdateBuilder(
       this.#model.table.name,
-      args.data,
-      compileWhere(args.where),
+      this.#encode(args.data),
+      compileWhere(args.where, dialect),
+      [],
+      dialect.quote,
     );
     const { sql, params } = builder.toSQL();
+
+    if (!dialect.countsMatchedRows) {
+      // MySQL and MariaDB report the rows that changed, not the rows that
+      // matched. Count the matching rows first so the reported count is the
+      // number of rows the statement applied to.
+      const matched = await this.count({ where: args.where });
+      await this.#db.executeRun(sql, params);
+      return { count: matched };
+    }
+
     const result = await this.#db.executeRun(sql, params);
     return { count: result.changes };
   }
 
   async upsert(args: UpsertArgs): Promise<T> {
-    const where = compileWhere(args.where);
-    const existing = where ? await this.findFirst({ where: args.where }) : null;
-    if (existing) {
-      return this.update({ where: args.where, data: args.update, select: args.select });
-    }
-    return this.create({ data: args.create, select: args.select });
-  }
+    const dialect = this.#db.dialect;
+    const table = this.#model.table.name;
+    const conflictColumns = this.#conflictColumns(args.where);
 
-  async delete(args: DeleteArgs): Promise<T> {
-    const builder = new DeleteBuilder(
-      this.#model.table.name,
-      compileWhere(args.where),
-      args.select ?? ['*'],
-    );
-    const { sql, params } = builder.toSQL();
-    const rows = await this.#db.executeAll<T>(sql, params);
-    if (rows[0]) return rows[0];
+    const { sql, params: rawParams } = dialect.upsert({
+      table,
+      values: this.#encode(args.create),
+      conflictColumns,
+      update: this.#encode(args.update),
+    });
+    const params = rawParams.map(normalizeParam);
+
+    if (dialect.supportsReturningOnUpdate) {
+      const returning = (args.select ?? ['*'])
+        .map((column) => (column === '*' ? column : dialect.quote(column)))
+        .join(', ');
+      const rows = await this.#db.executeAll<Record<string, unknown>>(
+        `${sql} RETURNING ${returning}`,
+        params,
+      );
+      if (rows[0]) return this.#decode(rows[0]) as T;
+    } else {
+      await this.#db.executeRun(sql, params);
+    }
+
+    const found = await this.findFirst({ where: args.where, select: args.select });
+    if (found) return found;
     throw new NotFoundError(this.#model.name);
   }
 
+  async delete(args: DeleteArgs): Promise<T> {
+    const dialect = this.#db.dialect;
+    const table = this.#model.table.name;
+
+    if (dialect.supportsReturningOnUpdate) {
+      const builder = new DeleteBuilder(
+        table,
+        compileWhere(args.where, dialect),
+        args.select ?? ['*'],
+        dialect.quote,
+      );
+      const { sql, params } = builder.toSQL();
+      const rows = await this.#db.executeAll<Record<string, unknown>>(sql, params);
+      if (rows[0]) return this.#decode(rows[0]) as T;
+      throw new NotFoundError(this.#model.name);
+    }
+
+    // No RETURNING on DELETE: delete first, then read the row back.
+    const found = await this.findFirst({ where: args.where, select: args.select });
+    if (!found) throw new NotFoundError(this.#model.name);
+
+    const builder = new DeleteBuilder(
+      table,
+      compileWhere(args.where, dialect),
+      [],
+      dialect.quote,
+    );
+    const { sql, params } = builder.toSQL();
+    await this.#db.executeRun(sql, params);
+    return found;
+  }
+
   async deleteMany(args: DeleteManyArgs = {}): Promise<{ count: number }> {
-    const builder = new DeleteBuilder(this.#model.table.name, compileWhere(args.where));
+    const builder = new DeleteBuilder(
+      this.#model.table.name,
+      compileWhere(args.where, this.#db.dialect),
+      [],
+      this.#db.dialect.quote,
+    );
     const { sql, params } = builder.toSQL();
     const result = await this.#db.executeRun(sql, params);
     return { count: result.changes };
+  }
+
+  /** Column names used as the conflict target of an upsert. */
+  #conflictColumns(where: WhereInput): string[] {
+    return Object.keys(where);
   }
 
   #primaryKeyOf(data: Record<string, unknown>): { name: string; value: unknown } | null {
@@ -402,6 +566,44 @@ export class ModelDelegate<T = Record<string, unknown>> {
     const value = data[primary.name];
     if (value === undefined) return null;
     return { name: primary.name, value };
+  }
+
+  /**
+   * The primary key the database generated for an inserted row.
+   *
+   * MySQL reports the generated auto-increment value as the last insert id;
+   * PostgreSQL reports none because it uses `RETURNING`.
+   */
+  #generatedPrimaryKey(result: { lastInsertRowid: number }): { name: string; value: unknown } | null {
+    const primary = this.#model.table.columns.find((c) => c.primaryKey && c.autoIncrement);
+    if (!primary) return null;
+    if (!result.lastInsertRowid) return null;
+    return { name: primary.name, value: result.lastInsertRowid };
+  }
+
+  /**
+   * Converts the values of a row into the types the schema declares.
+   *
+   * A `boolean` column is an integer on SQLite, MySQL and MariaDB, so the
+   * stored `1` becomes `true` again. PostgreSQL already returns a boolean.
+   */
+  #decode(row: Record<string, unknown>): Record<string, unknown> {
+    const booleans = this.#model.table.columns.filter((c) => c.type === 'boolean');
+    if (booleans.length === 0) return row;
+    for (const column of booleans) {
+      const value = row[column.name];
+      if (typeof value === 'number') row[column.name] = value !== 0;
+    }
+    return row;
+  }
+
+  /** Converts the values of a write into the way the backend stores them. */
+  #encode(data: Record<string, unknown>): Record<string, unknown> {
+    const encoded: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      encoded[key] = typeof value === 'boolean' ? this.#db.dialect.toStorage(value) : value;
+    }
+    return encoded;
   }
 }
 
@@ -440,15 +642,43 @@ export class UniqueConstraintError extends OrmError {
  */
 export class Database {
   readonly #driver: Driver;
+  readonly #dialect: Dialect;
   readonly #delegates = new Map<string, ModelDelegate<any>>();
   readonly #models: ModelDefinition[] = [];
 
   constructor(driver: Driver) {
     this.#driver = driver;
+    this.#dialect = getDialect(driver.kind);
   }
 
   static sqlite(options: { file?: string; readonly?: boolean; create?: boolean } = {}): Database {
     return new Database(new SqliteDriver(options));
+  }
+
+  static postgres(options: {
+    url: string;
+    max?: number;
+    tls?: boolean;
+  }): Database {
+    return new Database(new PostgresDriver(options));
+  }
+
+  static mysql(options: {
+    url: string;
+    max?: number;
+    tls?: boolean;
+    allowPublicKeyRetrieval?: boolean;
+  }): Database {
+    return new Database(new MysqlDriver(options));
+  }
+
+  static mariadb(options: {
+    url: string;
+    max?: number;
+    tls?: boolean;
+    allowPublicKeyRetrieval?: boolean;
+  }): Database {
+    return new Database(new MariadbDriver(options));
   }
 
   model(definition: ModelDefinition): ModelDelegate<any> {
@@ -466,8 +696,23 @@ export class Database {
     return this.#driver;
   }
 
+  /** The SQL dialect this database speaks. */
+  get dialect(): Dialect {
+    return this.#dialect;
+  }
+
+  /** The name of the dialect this database speaks. */
+  get dialectName(): DialectName {
+    return this.#dialect.name;
+  }
+
   /* ------------------------------ raw execution ---------------------------- */
 
+  /**
+   * Executes a statement with portable `?` placeholders. The driver renders
+   * the statement and its identifiers to the dialect of the backend, so the
+   * same code works on SQLite, PostgreSQL, MySQL and MariaDB.
+   */
   async executeAll<T = Record<string, unknown>>(sql: string, params: SqlParam[] = []): Promise<T[]> {
     return this.#driver.all<T>(sql, params);
   }
@@ -510,3 +755,4 @@ export class Database {
 }
 
 export { normalizeParam };
+export type { Quote };

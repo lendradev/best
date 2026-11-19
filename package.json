@@ -1,6 +1,6 @@
 {
   "name": "best",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "description": "Best — a NestJS-style application framework and a Prisma-style ORM, built natively on Bun with zero runtime dependencies.",
   "type": "module",

@@ -3,7 +3,15 @@
 A NestJS-style application framework and a Prisma-style ORM, built natively on
 Bun with **zero runtime dependencies**.
 
-> **Status: v0.1.0 — early. The API is not frozen.**
+> **Status: v0.2.0 — early. The API is not frozen.**
+
+## Upgrading from v0.1.0
+
+- `PostgresDriverOptions` is now `SqlDriverOptions`. It is the option type for
+  every `Bun.SQL` driver, so it carries `allowPublicKeyRetrieval` as well.
+  `PostgresDriver` still takes the same options it did before.
+- `MysqlDriver` and `MariadbDriver` are new, along with the dialect layer
+  behind them.
 
 ## Why
 
@@ -107,8 +115,13 @@ await user.findMany({ where: { age: { gte: 18 } }, orderBy: { column: 'name' } }
 await user.aggregate({ _count: true, _avg: { age: true } });
 ```
 
-Postgres uses the same API with `new PostgresDriver({ url })`. Raw SQL is
-available through `db.query(...)` and `db.raw\`...\``.
+Postgres, MySQL and MariaDB use the same API with a different driver:
+`new PostgresDriver({ url })`, `new MysqlDriver({ url })`,
+`new MariadbDriver({ url })`. The same model and the same calls work on every
+backend; the dialect takes care of the placeholder syntax, the quoting, the
+upsert syntax and how a boolean is stored.
+
+Raw SQL is available through `db.query(...)` and `db.raw\`...\``.
 
 ## Development
 
