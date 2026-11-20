@@ -248,7 +248,136 @@ work:
 
 ---
 
-## 4. Design decisions and their reasons
+## 4. Cache and worker
+
+### 4.1 Cache manager
+
+`CacheManager` is a key-value interface: `get`, `set`, `delete`, `clear`,
+`has` and `wrap`. `MemoryCacheStore` is the implementation that ships.
+
+Three properties matter for the store:
+
+- **A lifetime per entry.** An entry carries the time it expires and is
+  dropped when it is read after that time. There is no sweeper timer, so an
+  entry that is never read costs nothing.
+- **A size limit.** The store keeps a bounded number of entries and drops the
+  oldest one when it is full, so the cache cannot grow without limit.
+- **A copy on write.** The store copies the value it is given. A caller that
+  mutates the object it passed in cannot change what the cache holds.
+
+`wrap` runs the loader once. Two callers that miss at the same time share
+that call, so a slow query does not run twice.
+
+The cache is a plain store. It does not read through the ORM; a caller
+composes the read-through itself. That keeps the ORM unaware of the cache.
+
+### 4.2 Worker runtime
+
+`Worker` runs jobs from an in-process queue. A job is a plain object with a
+`name`, a `payload` and an optional inline `handle`. A registered handler
+routes the job by name.
+
+The runtime holds three limits:
+
+- **Concurrency.** At most `concurrency` jobs run at the same time.
+- **Attempts.** A job that throws is retried up to `maxAttempts` times.
+- **Backoff.** The delay before the next attempt grows by `backoffFactor`,
+  so a failing dependency is not hammered.
+
+The queue is **not durable**. A job that has not finished is lost when the
+process exits, and a retried job may run more than once. A job therefore has
+to be idempotent. The runtime does not promise exactly-once delivery.
+
+`stop()` stops accepting new jobs and discards the queue. The running jobs
+get an aborted signal, so a handler that watches `context.signal` can stop
+early; a handler that ignores it runs to completion and `stop()` waits for
+it.
+
+---
+
+## 5. HTTP capabilities
+
+### 5.1 Static files
+
+`createStaticHandler` serves a directory with `Bun.file`. It returns a plain
+fetch-style function, so it can sit in front of the router: it answers with a
+`Response` when the request maps to a file, and with `null` when it does not.
+
+The path is read from the raw request URL rather than from `URL.pathname`,
+because the `URL` parser collapses `..` segments and would hide a traversal
+attempt. Every segment is checked before the path is joined, and the resolved
+path has to stay inside the root, so a request cannot read a file outside the
+served directory.
+
+### 5.2 WebSocket gateway
+
+`createWebSocketGateway` routes messages between clients and the application.
+It never starts a server: `Bun.serve` stays with the caller, and the gateway
+only exposes `handleOpen`, `handleMessage` and `handleClose`. The
+`websocketHandlers` helper bundles them into the object `Bun.serve` expects.
+
+A client subscribes to a topic by sending a JSON message with a `topic` field.
+The gateway keeps a topic-to-socket map, so `publish` reaches the subscribers
+of a topic only. A socket is unsubscribed when it closes.
+
+### 5.3 Event emitter
+
+`createEventEmitter` is a small typed emitter. `emit` awaits every handler and
+collects the failures into an `AggregateError`, so one broken handler does not
+stop the others and does not hide the failure.
+
+---
+
+## 6. Operational capabilities
+
+### 6.1 Rate limiter
+
+`RateLimiter` counts the requests of a key in a fixed window. The counter is a
+map in the process heap, so the limit applies to one process. The state sits
+behind the `RateLimiter` interface, so a shared store can be added later.
+
+`RateLimitGuard` reads the client address from the proxy headers and throws
+`TooManyRequestsException` once the window is full.
+
+### 6.2 Scheduler
+
+`Scheduler` parses a five-field cron expression and computes the next run time
+from the expression on every tick, so a slow tick does not accumulate drift.
+A task that throws does not stop the scheduler: the failure goes to the
+`onError` callback and the task runs again on the next tick.
+
+The cron parser supports a wildcard, a step, a value, a range and a
+comma-separated list in every field, plus the short month and day names.
+
+### 6.3 Health check
+
+Each indicator reports on one dependency. The check runs them all, and a
+check that throws counts as down. `createHealthHandler` turns the report into
+a fetch handler that answers `200` or `503`.
+
+### 6.4 Serialization interceptor
+
+`createSerializationInterceptor` maps the value a handler returned. Without a
+transform it changes nothing.
+
+### 6.5 Password hashing and token signing
+
+`Bun.password` hashes with argon2 and runs the work in a worker thread. The
+token signer uses HMAC-SHA-256 from `crypto.subtle`, so the signing path holds
+no third-party code. The secret is required — there is no default — and the
+signature comparison runs over the whole string, so the timing does not depend
+on where the first difference is.
+
+### 6.6 OpenAPI generator
+
+The document is built from the route table the router already holds, so it
+describes the routes the application serves. A path parameter becomes a
+required path parameter, the handler name becomes the operation id, and the
+controller name becomes the tag.
+
+---
+
+## 7. Design decisions and their reasons
 
 | Decision | Reason | Cost |
 |---|---|---|
@@ -260,10 +389,23 @@ work:
 | A dialect object per backend | One query layer for four backends, no `if (postgres)` in the code | A new backend means a new dialect |
 | Portable `?` placeholders, rendered by the driver | The query layer never branches on the backend | A hand-written statement has to use `?`, not `$1` |
 | `RETURNING` for writes where the backend has it | One round trip per write | MySQL needs a read-back; PostgreSQL needs >= 8.2 |
+| The cache is in memory | It works with no external service, matching the zero-dependency rule | The entries are lost when the process exits |
+| The cache copies the value it stores | A caller cannot change the cache by mutating its own object | A deep copy costs time on every write |
+| The queue is in process | It works with no broker and no protocol client | A job in flight is lost when the process exits |
+| Jobs are retried rather than dropped | A transient failure does not lose the work | A job may run more than once, so it has to be idempotent |
+| The static handler reads the raw URL path | The `URL` parser collapses `..` and would hide a traversal | The query string and the fragment are cut by hand |
+| The gateway never starts a server | `Bun.serve` stays with the caller, who owns the port and the lifecycle | The caller has to wire the handlers into `Bun.serve` |
+| A failing event handler is collected, not swallowed | One broken listener must not hide its own failure | The caller has to handle the `AggregateError` |
+| The rate limiter counts in process | It works with no shared store, matching the zero-dependency rule | The limit applies per process, so several instances multiply it |
+| The cron expression is parsed in the framework | A five-field expression is small, and a dependency would break the rule | The parser covers the common syntax, not every cron extension |
+| The scheduler recomputes the next run on every tick | A slow tick does not accumulate drift | The expression is parsed once per task, not per tick |
+| The token secret is required | A default secret would be a silent security hole | Every application has to supply one |
+| The token signature is HMAC-SHA-256 from `crypto.subtle` | It is the Web Crypto API and needs no dependency | Only HMAC is offered, not RSA or ECDSA |
+| The OpenAPI document is generated from the route table | The document cannot drift from the routes | The document describes the paths, not the payload shapes |
 
 ---
 
-## 5. Known limitations
+## 8. Known limitations
 
 1. **Type-based DI is unavailable.** Without `emitDecoratorMetadata`, a
    constructor parameter cannot be resolved by its type alone. Every dependency
@@ -274,17 +416,30 @@ work:
    layer currently uses the application container for every request.
 4. **Middleware is declared but not executed.** The `UseMiddleware` decorator
    is exported, but it is not wired into the request pipeline yet.
-5. **No WebSocket, GraphQL, microservice or OpenAPI support.**
+5. **No GraphQL, microservice or message-broker support.** A protocol client
+   for either is its own piece of work and would break the zero-dependency
+   rule.
 6. **MySQL and MariaDB count the rows that changed.** The ORM compensates by
    counting the matching rows itself, which costs one extra query on
    `updateMany` and `deleteMany` for those two backends. Bun 1.4.0 has no
    support for the `foundRows` option that would avoid it.
 7. **A raw statement uses `?` for its parameters.** A hand-written PostgreSQL
    statement may use `$1`, but the two styles cannot be mixed.
+8. **The cache and the queue are per process.** A deployment with several
+   processes has one cache and one queue per process. The state sits behind an
+   interface, so a shared store can be added later.
+9. **The WebSocket gateway is per process.** A message published by one
+   instance does not reach the clients of another.
+10. **The rate limiter counts per process.** A deployment with several
+    instances allows the limit per instance, so the effective limit is the
+    configured limit times the instance count.
+11. **The OpenAPI document describes the paths, not the payload shapes.** The
+    route table carries no body or response schema, so the generated document
+    has a generic `200` response. The extra schemas can be passed in by hand.
 
 ---
 
-## 6. Sources
+## 9. Sources
 
 - Bun documentation: <https://bun.com/docs>
 - Bun SQL documentation: <https://bun.com/docs/sql>

@@ -6,7 +6,34 @@ runtime dependencies**.
 [![Bun](https://img.shields.io/badge/Bun-%3E%3D%201.4.0-black)](https://bun.sh)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> **Status: v0.2.0 — early. The API is not frozen.**
+> **Status: v0.3.0 — early. The API is not frozen.**
+
+## Changes in v0.3.0
+
+The framework grew the cross-cutting capabilities a service needs. Each one is
+a module with its own token, so a capability that is not used costs nothing.
+
+New capabilities, all exported from the root package:
+
+- **Cache manager** — an in-memory store with a lifetime per entry, a size
+  limit and a single-flight loader.
+- **Worker** — an in-process job queue with retries, backoff and a concurrency
+  limit.
+- **Events** — a typed emitter that collects handler failures into an
+  `AggregateError` instead of swallowing them.
+- **Static files** — a directory handler that refuses a path escaping the
+  served root.
+- **WebSockets** — a topic-based gateway that plugs into `Bun.serve`.
+- **Rate limiting** — a fixed-window counter and a guard that throws `429`.
+- **Scheduler** — a five-field cron parser and a drift-free timer.
+- **Health check** — indicators per dependency and a handler that answers
+  `200` or `503`.
+- **Serialization** — an interceptor that maps the handler result.
+- **Security** — argon2 password hashing and HMAC-SHA-256 token signing.
+- **OpenAPI** — a 3.1 document generated from the route table.
+
+The cache, the queue, the rate limiter and the gateway are per process. Their
+state sits behind an interface, so a shared store can be added later.
 
 ## Changes in v0.2.0
 
@@ -34,6 +61,14 @@ Breaking changes, all in the ORM:
 | HTTP | Modules, dependency injection, controllers, routing, guards, interceptors, exception filters, lifecycle hooks, request validation |
 | ORM | Schema helpers, a model delegate with `find` / `create` / `update` / `upsert` / `delete` / `aggregate`, SQL builders, migrations |
 | Backends | SQLite, PostgreSQL, MySQL, MariaDB behind one API and one dialect layer |
+| Cache | An in-memory cache manager with a lifetime per entry, a size limit and a single-flight loader |
+| Worker | An in-process job queue with retries, backoff and a concurrency limit |
+| Events | A typed event emitter that collects handler failures instead of swallowing them |
+| Static files | A directory handler with path-traversal protection |
+| WebSockets | A topic-based gateway that plugs into `Bun.serve` |
+| Operations | A rate limiter, a cron scheduler, a health check and a serialization interceptor |
+| Security | Argon2 password hashing and HMAC-SHA-256 token signing |
+| API docs | An OpenAPI 3.1 document generated from the route table |
 | Testing | `createTestingModule` for controller and provider tests |
 | CLI | `best new`, `best generate`, `best migrate`, `best dev`, `best start` |
 | Dependencies | None at runtime. `dependencies` is empty in `package.json` |
@@ -119,7 +154,9 @@ Every dependency names its token with `@Inject`, because Bun's transpiler does
 not emit decorator metadata.
 
 Also included: guards, interceptors, exception filters, lifecycle hooks, a
-`Logger`, a `ConfigService`, and `createTestingModule`.
+`Logger`, a `ConfigService`, an event emitter, a static file handler, a
+WebSocket gateway, a rate limiter, a scheduler, a health check, password
+hashing, token signing, an OpenAPI generator and `createTestingModule`.
 
 ## ORM
 

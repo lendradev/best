@@ -314,7 +314,337 @@ Applied 1 statement to app.db (sqlite)
 
 ---
 
-## 10. Testing
+## 10. Caching
+
+The cache manager keeps values in memory with a lifetime and a size limit.
+
+```ts
+import { CACHE_MANAGER, CacheModule } from 'best';
+import { Inject, Injectable, Module } from 'best';
+
+@Injectable()
+class UserService {
+  constructor(@Inject(CACHE_MANAGER) private readonly cache: CacheManager) {}
+
+  async find(id: string) {
+    return this.cache.wrap(`user:${id}`, async () => this.load(id));
+  }
+}
+
+@Module({ imports: [CacheModule], providers: [UserService] })
+class AppModule {}
+```
+
+`wrap` returns the cached value when there is one. When there is not, it
+calls the loader and stores the result. Two callers that miss at the same time
+share one loader call, so a slow query does not run twice.
+
+The store is in memory. An entry lives for `ttlMs` milliseconds and the store
+keeps at most `maxSize` entries, dropping the oldest one when it is full.
+`createCacheModule({ ttlMs, maxSize })` sets the defaults.
+
+---
+
+## 11. Background jobs
+
+The worker runs jobs outside the request. It is in process, so a job that has
+not finished is lost when the process exits, and a retried job may run more
+than once. A job has to be safe to run twice.
+
+```ts
+import { WORKER, Worker, WorkerModule } from 'best';
+
+const worker = new Worker({ concurrency: 4, maxAttempts: 3 });
+
+worker.register('send-welcome', async (payload: { email: string }) => {
+  await sendMail(payload.email);
+});
+
+await worker.enqueue({ name: 'send-welcome', payload: { email: 'a@example.com' } });
+```
+
+`enqueue` resolves once the job is queued. `run` resolves with the handler's
+result:
+
+```ts
+const result = await worker.run('send-welcome', { email: 'a@example.com' });
+```
+
+A job that throws is retried up to `maxAttempts` times, with the delay
+growing by `backoffFactor` each time. A job that runs out of attempts is
+counted in `worker.failed` and reported to the logger. The worker is
+registered in the container the same way the cache manager is:
+
+```ts
+@Module({ imports: [WorkerModule] })
+class AppModule {}
+```
+
+Call `worker.start()` to begin processing and `await worker.stop()` to drain
+the queue. Stopping aborts the signal of the running jobs, so a handler that
+watches `context.signal` can stop early.
+
+---
+
+## 12. Static files
+
+The static handler serves a directory over HTTP. It answers with `null` when
+the request does not match a file, so it can sit in front of the router.
+
+```ts
+import { createStaticHandler } from 'best';
+
+const serveStatic = createStaticHandler({ root: 'public', prefix: '/public' });
+```
+
+A path that tries to escape the served directory — through `..`, an encoded
+`..`, a backslash or a null byte — is answered with `403`.
+
+The handler is also available through the container:
+
+```ts
+import { STATIC_FILES, StaticFilesModule, Module } from 'best';
+
+@Module({ imports: [StaticFilesModule] })
+class AppModule {}
+```
+
+`createStaticFilesModule({ root, prefix, index, cacheControl })` builds the
+same module with a custom configuration.
+
+---
+
+## 13. WebSockets
+
+The gateway routes messages between clients and the application. It never
+starts a server, so `Bun.serve` stays with you.
+
+```ts
+import { createWebSocketGateway, websocketHandlers } from 'best';
+
+const gateway = createWebSocketGateway({ path: '/ws' });
+
+gateway.on('news', (data) => console.log(data));
+
+Bun.serve({
+  fetch: handleHttp,
+  websocket: websocketHandlers(gateway),
+});
+```
+
+A client subscribes to a topic by sending a JSON message:
+
+```json
+{ "topic": "news", "data": "hello" }
+```
+
+`gateway.publish('news', 'hello')` sends a message to the subscribers of that
+topic. A message that is not JSON goes to every connected client.
+
+---
+
+## 14. Events
+
+The event emitter connects parts of an application without them knowing about
+each other.
+
+```ts
+import { createEventEmitter } from 'best';
+
+const emitter = createEventEmitter();
+
+emitter.on('user.created', async (payload: { id: number }) => {
+  await sendWelcomeMail(payload.id);
+});
+
+await emitter.emit('user.created', { id: 1 });
+```
+
+`emit` awaits every handler. A handler that throws does not stop the others:
+the failures are collected into an `AggregateError`.
+
+The emitter is also available through the container:
+
+```ts
+import { EVENT_EMITTER, EventsModule, Module } from 'best';
+
+@Module({ imports: [EventsModule] })
+class AppModule {}
+```
+
+---
+
+## 15. Rate limiting
+
+The limiter counts the requests of a client in a fixed window. The guard
+throws `TooManyRequestsException` once the window is full.
+
+```ts
+import { UseGuards, createRateLimitGuard } from 'best';
+
+@Controller('/reports')
+export class ReportController {
+  @Get('/')
+  @UseGuards(createRateLimitGuard({ limit: 10, windowMs: 60_000 }))
+  list() {
+    return [];
+  }
+}
+```
+
+The counter lives in the process heap, so the limit applies per process. The
+limiter is also available through the container:
+
+```ts
+import { RATE_LIMITER, RateLimiterModule, Module } from 'best';
+
+@Module({ imports: [RateLimiterModule] })
+class AppModule {}
+```
+
+---
+
+## 16. Scheduled jobs
+
+The scheduler runs a task on a cron expression. The expression has five
+fields: minute, hour, day of month, month, day of week.
+
+```ts
+import { createScheduler } from 'best';
+
+const scheduler = createScheduler({
+  onError: (error, expression) => console.error(expression, error),
+});
+
+scheduler.schedule('*/15 * * * *', async () => {
+  await refreshReports();
+});
+scheduler.start();
+```
+
+A task that throws does not stop the scheduler. The scheduler is also
+available through the container:
+
+```ts
+import { SCHEDULER, SchedulerModule, Module } from 'best';
+
+@Module({ imports: [SchedulerModule] })
+class AppModule {}
+```
+
+---
+
+## 17. Health check
+
+Each indicator reports on one dependency. The handler answers `200` when
+everything is up and `503` when one is down.
+
+```ts
+import { createHealthCheck, createHealthHandler, createHealthIndicator } from 'best';
+
+const health = createHealthCheck([
+  createHealthIndicator('database', async () => {
+    await db.query('SELECT 1');
+    return { status: 'up' };
+  }),
+]);
+
+const handler = createHealthHandler(health);
+```
+
+---
+
+## 18. Serialization
+
+The serialization interceptor maps the value a handler returned into the
+response body. Without a transform it changes nothing.
+
+```ts
+import { UseInterceptors, createSerializationInterceptor } from 'best';
+
+@Controller('/users')
+export class UserController {
+  @Get('/:id')
+  @UseInterceptors(
+    createSerializationInterceptor({
+      transform: (value) => {
+        const { password, ...rest } = value as Record<string, unknown>;
+        return rest;
+      },
+    }),
+  )
+  findOne() {
+    return this.service.find();
+  }
+}
+```
+
+---
+
+## 19. Passwords and tokens
+
+`hashPassword` uses argon2 through `Bun.password`. `signToken` signs a
+payload with HMAC-SHA-256; the secret is required.
+
+```ts
+import { hashPassword, signToken, verifyPassword, verifyToken } from 'best';
+
+const hash = await hashPassword('correct horse');
+const ok = await verifyPassword('correct horse', hash);
+
+const { token, expiresAt } = await signToken(
+  { sub: user.id },
+  { secret: process.env.SECRET!, expiresInMs: 3_600_000 },
+);
+const payload = await verifyToken(token, { secret: process.env.SECRET! });
+```
+
+Both are also available through the container. The token signer needs a
+secret, so it is registered through `createSecurityModule`:
+
+```ts
+import { PASSWORD_HASHER, TOKEN_SIGNER, createSecurityModule, Module } from 'best';
+
+@Module({ imports: [createSecurityModule({ secret: process.env.SECRET! })] })
+class AppModule {}
+```
+
+---
+
+## 20. OpenAPI
+
+The document is generated from the route table, so it describes the routes the
+application actually serves.
+
+```ts
+import { createOpenApiDocument } from 'best';
+
+const app = await createContext([AppModule]);
+const document = createOpenApiDocument({
+  title: 'My API',
+  version: '1.0.0',
+  routes: app.router.routes,
+});
+```
+
+The document carries the paths, the path parameters and the operation ids.
+The payload shapes are not in the route table, so the shared schemas are
+passed in by hand:
+
+```ts
+createOpenApiDocument({
+  title: 'My API',
+  version: '1.0.0',
+  routes: app.router.routes,
+  schemas: {
+    User: { type: 'object', properties: { id: { type: 'string' } } },
+  },
+});
+```
+
+---
+
+## 21. Testing
 
 ```ts
 import { describe, expect, test } from 'bun:test';
@@ -329,7 +659,7 @@ The framework's own suite runs with `bun test`.
 
 ---
 
-## 11. Commands
+## 22. Commands
 
 | Command | Description |
 |---|---|
@@ -340,9 +670,5 @@ The framework's own suite runs with `bun test`.
 | `best dev` | Run `src/main.ts` with hot reload |
 | `best start` | Run `src/main.ts` |
 
-The package has no `bin` entry yet, so the CLI is reached through the source
-path in a scaffolded project:
-
-```bash
-bun run node_modules/best/src/cli/index.ts migrate src/schema.ts --db app.db
-```
+The CLI is registered as the `best` binary, so `bunx best <command>` works
+once the package is installed.

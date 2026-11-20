@@ -93,3 +93,140 @@ export type { RequestContext, ResponseContext, RouteDefinition } from './http/co
 export { Logger } from './common/logger.ts';
 export { ConfigService } from './common/config.ts';
 export * as orm from './orm/index.ts';
+
+export {
+  CACHE_MANAGER,
+  CacheModule,
+  DEFAULT_MAX_SIZE,
+  DEFAULT_TTL_MS,
+  MemoryCacheStore,
+  createCacheModule,
+} from './cache/index.ts';
+export type { CacheManager, CacheSetOptions, MemoryCacheOptions } from './cache/index.ts';
+
+export {
+  WORKER,
+  Worker,
+  WorkerModule,
+  createWorkerModule,
+} from './worker/index.ts';
+export type { Job, JobContext, JobHandler, WorkerOptions } from './worker/index.ts';
+
+export {
+  STATIC_FILES,
+  StaticFilesModule,
+  createStaticFilesModule,
+  createStaticHandler,
+} from './static/index.ts';
+export type { StaticFilesOptions } from './static/index.ts';
+
+export {
+  WEBSOCKET_GATEWAY,
+  WebSocketModule,
+  createWebSocketGateway,
+  createWebSocketModule,
+  websocketHandlers,
+} from './websocket/index.ts';
+export type {
+  MessageHandler,
+  WebSocketGateway,
+  WebSocketGatewayOptions,
+  WebSocketHandlers,
+} from './websocket/index.ts';
+
+export { EVENT_EMITTER, EventsModule, createEventEmitter } from './events/index.ts';
+export type { EventEmitter, EventHandler } from './events/index.ts';
+
+export {
+  RATE_LIMITER,
+  RateLimitGuard,
+  RateLimiterModule,
+  createRateLimitGuard,
+  createRateLimiter,
+  createRateLimiterModule,
+  defaultKeyResolver,
+} from './ratelimit/index.ts';
+export type { RateLimitResult, RateLimiter, RateLimiterOptions } from './ratelimit/index.ts';
+
+export {
+  SCHEDULER,
+  CronParseError,
+  SchedulerModule,
+  createScheduler,
+  createSchedulerModule,
+  nextRunAt,
+  parseCronExpression,
+} from './scheduler/index.ts';
+export type {
+  CronExpression,
+  Scheduler,
+  SchedulerOptions,
+  SchedulerTask,
+} from './scheduler/index.ts';
+
+export {
+  HEALTH_CHECK,
+  HealthModule,
+  createHealthCheck,
+  createHealthHandler,
+  createHealthIndicator,
+  createHealthModule,
+} from './health/index.ts';
+export type {
+  HealthCheck,
+  HealthCheckOptions,
+  HealthIndicator,
+  HealthIndicatorResult,
+  HealthReport,
+  HealthStatus,
+} from './health/index.ts';
+
+export {
+  SERIALIZATION_INTERCEPTOR,
+  SerializationModule,
+  createSerializationInterceptor,
+  createSerializationModule,
+} from './serialization/index.ts';
+export type {
+  SerializationInterceptor,
+  SerializationOptions,
+} from './serialization/index.ts';
+
+export {
+  PASSWORD_HASHER,
+  SecurityModule,
+  TOKEN_SIGNER,
+  createSecurityModule,
+  hashPassword,
+  signToken,
+  verifyPassword,
+  verifyToken,
+} from './security/index.ts';
+export type {
+  HashPasswordOptions,
+  PasswordAlgorithm,
+  PasswordHasher,
+  SecurityModuleOptions,
+  SignTokenOptions,
+  SignTokenResult,
+  TokenPayload,
+  TokenSigner,
+  VerifyTokenOptions,
+} from './security/index.ts';
+
+export {
+  OPENAPI_DOCUMENT,
+  OpenApiModule,
+  createOpenApiDocument,
+  createOpenApiModule,
+} from './openapi/index.ts';
+export type {
+  OpenApiDocument,
+  OpenApiInfo,
+  OpenApiModuleOptions,
+  OpenApiOperation,
+  OpenApiOptions,
+  OpenApiParameter,
+  OpenApiRequestBody,
+  OpenApiResponse,
+} from './openapi/index.ts';
