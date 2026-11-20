@@ -2,11 +2,14 @@
   "name": "best",
   "version": "0.2.0",
   "private": false,
-  "description": "Best — a NestJS-style application framework and a Prisma-style ORM, built natively on Bun with zero runtime dependencies.",
+  "description": "Best — an HTTP application framework and a SQL ORM, built natively on Bun with zero runtime dependencies.",
   "type": "module",
   "license": "MIT",
   "engines": {
     "bun": ">=1.4.0"
+  },
+  "bin": {
+    "best": "./src/cli/index.ts"
   },
   "module": "src/index.ts",
   "main": "src/index.ts",
@@ -39,8 +42,10 @@
     "bun",
     "framework",
     "orm",
-    "nestjs",
-    "prisma",
-    "drizzle"
+    "sql",
+    "sqlite",
+    "postgres",
+    "mysql",
+    "mariadb"
   ]
 }

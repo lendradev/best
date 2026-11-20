@@ -1,5 +1,5 @@
 /**
- * ORM client — Prisma-style API over Drizzle-style SQL builders.
+ * ORM client — a model API over inspectable SQL builders.
  *
  * `db.user.findMany({ where: { email: { contains: 'x' } } })` compiles to a
  * parameterized SQL statement and executes it on the configured driver.
@@ -19,9 +19,11 @@ import { getDialect, type Dialect, type DialectName } from './dialect.ts';
 import {
   DeleteBuilder,
   InsertBuilder,
+  ORDER_DIRECTIONS,
   SelectBuilder,
   UpdateBuilder,
   type OrderBy,
+  type OrderDirection,
   type Quote,
 } from './query-builder.ts';
 import {
@@ -212,25 +214,49 @@ function ilike(column: string, pattern: string, dialect: Dialect): SQL {
  *
  * The column names are quoted with the dialect's rules, so a column such as
  * `userId` keeps its case on PostgreSQL, which folds unquoted identifiers to
- * lower case.
+ * lower case. A key that is already qualified (`user.name`) or already quoted
+ * is rejected: quoting it again would build a column name that does not
+ * exist, and the query would silently match no row.
  */
-export function compileWhere(where: WhereInput | undefined, dialect?: Dialect): SQL | undefined {
+function compileWhere(where: WhereInput | undefined, dialect: Dialect): SQL | undefined {
   if (!where) return undefined;
-  const effective = dialect ?? getDialect('sqlite');
   const conditions: SQL[] = [];
   for (const [column, value] of Object.entries(where)) {
-    const compiled = compileCondition(effective.quote(column), value, effective);
+    assertColumnKey(column);
+    const compiled = compileCondition(dialect.quote(column), value, dialect);
     if (compiled) conditions.push(compiled);
   }
   if (conditions.length === 0) return undefined;
   return and(...conditions);
 }
 
-function normalizeOrderBy(orderBy: FindManyArgs['orderBy']): OrderBy[] {
-  if (!orderBy) return [];
-  return Array.isArray(orderBy) ? orderBy : [orderBy];
+/**
+ * Rejects a where key that is not a plain column name.
+ *
+ * Only a bare column name is supported, so a qualified or pre-quoted key is
+ * reported instead of being turned into an identifier that matches nothing.
+ */
+function assertColumnKey(column: string): void {
+  if (column.includes('.') || column.includes('"') || column.includes('`')) {
+    throw new OrmError(
+      `Invalid where key ${JSON.stringify(column)}; use a plain column name`,
+    );
+  }
 }
 
+function normalizeOrderBy(orderBy: FindManyArgs['orderBy']): OrderBy[] {
+  if (!orderBy) return [];
+  const entries = Array.isArray(orderBy) ? orderBy : [orderBy];
+  return entries.map((entry) => {
+    const direction = String(entry.direction).toLowerCase();
+    if (!ORDER_DIRECTIONS.includes(direction as OrderDirection)) {
+      throw new OrmError(
+        `Invalid order direction ${JSON.stringify(entry.direction)}; expected "asc" or "desc"`,
+      );
+    }
+    return { column: entry.column, direction: direction as OrderDirection };
+  });
+}
 /* -------------------------------------------------------------------------- */
 /* Model delegate                                                             */
 /* -------------------------------------------------------------------------- */
@@ -375,13 +401,13 @@ export class ModelDelegate<T = Record<string, unknown>> {
         dialect.quote,
       );
       const { sql, params } = builder.toSQL();
-      const rows = await this.#db.executeAll<Record<string, unknown>>(sql, params);
+      const rows = await this.#all<Record<string, unknown>>(sql, params);
       if (rows[0]) return this.#decode(rows[0]) as T;
     } else {
       // No RETURNING: insert, then read the row back by primary key.
       const builder = new InsertBuilder(table, [data], [], undefined, dialect.quote);
       const { sql, params } = builder.toSQL();
-      const result = await this.#db.executeRun(sql, params);
+      const result = await this.#run(sql, params);
 
       const primaryKey = this.#primaryKeyOf(data) ?? this.#generatedPrimaryKey(result);
       if (primaryKey) {
@@ -391,17 +417,35 @@ export class ModelDelegate<T = Record<string, unknown>> {
         });
         if (found) return found;
       }
-      return this.#decode(data) as T;
+
+      // A table without a primary key can still be read back by a unique
+      // column; without one the defaults the database applied are unknown.
+      const unique = this.#uniqueColumnOf(data);
+      if (unique) {
+        const found = await this.findUnique({
+          where: { [unique.name]: unique.value } as WhereInput,
+          select: args.select,
+        });
+        if (found) return found;
+      }
+
+      throw new OrmError(
+        `Cannot read back the inserted ${this.#model.name} row: the table has no primary key or unique column to look it up by`,
+      );
     }
 
+    // The row was not returned by the statement, so it is read back by the
+    // primary key the caller supplied.
     const primaryKey = this.#primaryKeyOf(data);
     if (primaryKey) {
       const found = await this.findUnique({
         where: { [primaryKey.name]: primaryKey.value } as WhereInput,
+        select: args.select,
       });
       if (found) return found;
     }
-    return this.#decode(data) as T;
+
+    throw new OrmError(`Insert into ${table} returned no row`);
   }
 
   async createMany(args: CreateManyArgs): Promise<{ count: number }> {
@@ -414,7 +458,7 @@ export class ModelDelegate<T = Record<string, unknown>> {
       this.#db.dialect.quote,
     );
     const { sql, params } = builder.toSQL();
-    const result = await this.#db.executeRun(sql, params);
+    const result = await this.#run(sql, params);
     return { count: result.changes };
   }
 
@@ -432,12 +476,18 @@ export class ModelDelegate<T = Record<string, unknown>> {
         dialect.quote,
       );
       const { sql, params } = builder.toSQL();
-      const rows = await this.#db.executeAll<Record<string, unknown>>(sql, params);
+      const rows = await this.#all<Record<string, unknown>>(sql, params);
       if (rows[0]) return this.#decode(rows[0]) as T;
       throw new NotFoundError(this.#model.name);
     }
 
-    // No RETURNING on UPDATE: update first, then read the row back.
+    // No RETURNING on UPDATE: the row the update matches is read before the
+    // update, because the update may change the columns the where clause
+    // matches on.
+    const primary = this.#model.table.columns.find((c) => c.primaryKey);
+    const before = (await this.findFirst({ where: args.where })) as Record<string, unknown> | null;
+    if (!before) throw new NotFoundError(this.#model.name);
+
     const builder = new UpdateBuilder(
       table,
       data,
@@ -446,14 +496,67 @@ export class ModelDelegate<T = Record<string, unknown>> {
       dialect.quote,
     );
     const { sql, params } = builder.toSQL();
-    await this.#db.executeRun(sql, params);
+    await this.#run(sql, params);
 
-    // The row count cannot decide whether the row exists: MySQL and MariaDB
-    // count the rows that changed, so an update that writes the same values
-    // reports zero for a row that is there.
-    const found = await this.findFirst({ where: args.where, select: args.select });
-    if (found) return found;
-    throw new NotFoundError(this.#model.name);
+    if (primary) {
+      // The update may have changed the primary key, so the row is read back
+      // by the value it carries now, not by the value it had before.
+      const value = data[primary.name] !== undefined ? data[primary.name] : before[primary.name];
+      const found = await this.findUnique({
+        where: { [primary.name]: value } as WhereInput,
+        select: args.select,
+      });
+      if (found) return found;
+    } else {
+      // The row is read back by the where clause with the updated values,
+      // because the update may have changed the columns the where clause
+      // matches on.
+      const updatedWhere = this.#updatedWhere(args.where, data);
+      if (updatedWhere) {
+        const found = await this.findUnique({ where: updatedWhere, select: args.select });
+        if (found) return found;
+      }
+    }
+
+    // The write already happened, so the row is reported from the values the
+    // database had and the values the update wrote. Reporting an error here
+    // would tell the caller the write failed when it succeeded.
+    return this.#updatedRow(before, data, args.select) as T;
+  }
+
+  /**
+   * Rebuilds the updated row from the row the update matched.
+   *
+   * Used by the tables without a primary key, where the row cannot be looked
+   * up after the update.
+   */
+  #updatedRow(
+    before: Record<string, unknown>,
+    data: Record<string, unknown>,
+    select?: string[],
+  ): Record<string, unknown> {
+    const merged = this.#decode({ ...before, ...data });
+    if (!select || select.includes('*')) return merged;
+    const picked: Record<string, unknown> = {};
+    for (const column of select) picked[column] = merged[column];
+    return picked;
+  }
+
+  /**
+   * Builds the where clause that matches the row after the update.
+   *
+   * Every column the where clause matches on that the update also writes gets
+   * the new value. Returns null when the update writes none of them, because
+   * the updated row could then not be identified.
+   */
+  #updatedWhere(where: WhereInput, data: Record<string, unknown>): WhereInput | null {
+    const updated: WhereInput = {};
+    for (const [column, value] of Object.entries(where)) {
+      if (typeof value === 'object' && value !== null && !(value instanceof Date)) return null;
+      if (!(column in data)) return null;
+      updated[column] = data[column] as WhereValue;
+    }
+    return Object.keys(updated).length > 0 ? updated : null;
   }
 
   async updateMany(args: UpdateManyArgs): Promise<{ count: number }> {
@@ -472,11 +575,11 @@ export class ModelDelegate<T = Record<string, unknown>> {
       // matched. Count the matching rows first so the reported count is the
       // number of rows the statement applied to.
       const matched = await this.count({ where: args.where });
-      await this.#db.executeRun(sql, params);
+      await this.#run(sql, params);
       return { count: matched };
     }
 
-    const result = await this.#db.executeRun(sql, params);
+    const result = await this.#run(sql, params);
     return { count: result.changes };
   }
 
@@ -484,6 +587,27 @@ export class ModelDelegate<T = Record<string, unknown>> {
     const dialect = this.#db.dialect;
     const table = this.#model.table.name;
     const conflictColumns = this.#conflictColumns(args.where);
+    this.#assertUniqueConflictTarget(args.where);
+    this.#assertConflictTargetStable(args.where, args.update);
+
+    // The conflict target is a unique key, so it identifies at most one row.
+    // Whether that row exists decides which row the statement touches. Only
+    // the backends without RETURNING need to know, because only they have to
+    // look the row up afterwards.
+    const before = dialect.supportsReturningOnUpdate
+      ? null
+      : await this.findFirst({ where: args.where });
+
+    // MySQL and MariaDB resolve the conflict from any unique key of the
+    // table, so a create payload that collides with a different unique key
+    // makes the statement update that other row.
+    if (dialect.name === 'mysql' || dialect.name === 'mariadb') {
+      await this.#assertNoOtherUniqueConflict(
+        args.create,
+        args.where,
+        before as Record<string, unknown> | null,
+      );
+    }
 
     const { sql, params: rawParams } = dialect.upsert({
       table,
@@ -497,16 +621,40 @@ export class ModelDelegate<T = Record<string, unknown>> {
       const returning = (args.select ?? ['*'])
         .map((column) => (column === '*' ? column : dialect.quote(column)))
         .join(', ');
-      const rows = await this.#db.executeAll<Record<string, unknown>>(
+      const rows = await this.#all<Record<string, unknown>>(
         `${sql} RETURNING ${returning}`,
         params,
       );
       if (rows[0]) return this.#decode(rows[0]) as T;
     } else {
-      await this.#db.executeRun(sql, params);
+      const result = await this.#run(sql, params);
+
+      // The conflict target keeps its value, so it names the row the statement
+      // inserted or updated. The last insert id is not used for that: it is
+      // unrelated to the row the statement touched when the statement updated
+      // an existing row.
+      const found = await this.findUnique({ where: args.where, select: args.select });
+      if (found) return found;
+
+      if (!before) {
+        // The statement inserted a new row: the database generated its
+        // primary key, so the where clause does not match it.
+        const generated = this.#generatedPrimaryKey(result);
+        if (generated) {
+          const inserted = await this.findUnique({
+            where: { [generated.name]: generated.value } as WhereInput,
+            select: args.select,
+          });
+          if (inserted) return inserted;
+        }
+      } else {
+        // The write already happened, so the row is reported from the values
+        // the database had and the values the upsert wrote.
+        return this.#updatedRow(before, this.#encode(args.update), args.select) as T;
+      }
     }
 
-    const found = await this.findFirst({ where: args.where, select: args.select });
+    const found = await this.findUnique({ where: args.where, select: args.select });
     if (found) return found;
     throw new NotFoundError(this.#model.name);
   }
@@ -523,7 +671,7 @@ export class ModelDelegate<T = Record<string, unknown>> {
         dialect.quote,
       );
       const { sql, params } = builder.toSQL();
-      const rows = await this.#db.executeAll<Record<string, unknown>>(sql, params);
+      const rows = await this.#all<Record<string, unknown>>(sql, params);
       if (rows[0]) return this.#decode(rows[0]) as T;
       throw new NotFoundError(this.#model.name);
     }
@@ -539,7 +687,7 @@ export class ModelDelegate<T = Record<string, unknown>> {
       dialect.quote,
     );
     const { sql, params } = builder.toSQL();
-    await this.#db.executeRun(sql, params);
+    await this.#run(sql, params);
     return found;
   }
 
@@ -551,7 +699,7 @@ export class ModelDelegate<T = Record<string, unknown>> {
       this.#db.dialect.quote,
     );
     const { sql, params } = builder.toSQL();
-    const result = await this.#db.executeRun(sql, params);
+    const result = await this.#run(sql, params);
     return { count: result.changes };
   }
 
@@ -560,12 +708,139 @@ export class ModelDelegate<T = Record<string, unknown>> {
     return Object.keys(where);
   }
 
+  /**
+   * Rejects an upsert whose conflict target is not a unique key.
+   *
+   * MySQL and MariaDB resolve the conflict from any unique key of the table
+   * and ignore the named columns, so a where clause on a non-unique column
+   * inserts a duplicate row instead of updating the existing one. SQLite and
+   * PostgreSQL reject the statement outright. Both outcomes are wrong, so the
+   * target is checked against the schema before the statement is built.
+   */
+  #assertUniqueConflictTarget(where: WhereInput): void {
+    const keys = Object.keys(where);
+    if (keys.length === 0) {
+      throw new OrmError(`Cannot upsert ${this.#model.name}: the conflict target is empty`);
+    }
+
+    // A column that is only part of a composite key is not unique on its own.
+    const compositeColumns = new Set<string>();
+    const primaryKeys = this.#model.table.columns.filter((c) => c.primaryKey);
+    if (primaryKeys.length > 1) {
+      for (const column of primaryKeys) compositeColumns.add(column.name);
+    }
+    for (const index of this.#model.table.indexes) {
+      if (!index.unique || index.columns.length < 2) continue;
+      for (const column of index.columns) compositeColumns.add(column);
+    }
+
+    const unique = new Set<string>();
+    for (const column of this.#model.table.columns) {
+      if (compositeColumns.has(column.name)) continue;
+      if (column.primaryKey || column.unique) unique.add(column.name);
+    }
+    for (const index of this.#model.table.indexes) {
+      if (index.unique && index.columns.length === 1) unique.add(index.columns[0] as string);
+    }
+
+    // A unique index over several columns is a conflict target of its own, so
+    // the whole set of columns has to match it.
+    const composite = this.#model.table.indexes.some(
+      (index) =>
+        index.unique &&
+        index.columns.length > 1 &&
+        index.columns.every((column) => keys.includes(column)),
+    );
+    if (composite) return;
+
+    const notUnique = keys.filter((column) => !unique.has(column));
+    if (notUnique.length > 0) {
+      throw new OrmError(
+        `Cannot upsert ${this.#model.name}: ${notUnique.join(', ')} ${
+          notUnique.length === 1 ? 'is not a unique key' : 'are not unique keys'
+        } of the table`,
+      );
+    }
+  }
+
+  /**
+   * Rejects an upsert whose update writes the conflict target.
+   *
+   * The conflict target names the row the statement works on. When the update
+   * changes its value, the row the upsert touched can no longer be found
+   * under the target, so the statement is rejected before it runs.
+   */
+  #assertConflictTargetStable(where: WhereInput, update: Record<string, unknown>): void {
+    const changed = Object.keys(where).filter((column) => column in update);
+    if (changed.length === 0) return;
+    throw new OrmError(
+      `Cannot upsert ${this.#model.name}: the update changes the conflict target (${changed.join(', ')}), so the upserted row could not be found`,
+    );
+  }
+
+  /**
+   * Rejects an upsert whose create payload collides with a different unique
+   * key than the conflict target.
+   *
+   * MySQL and MariaDB resolve the conflict from any unique key of the table.
+   * When the create payload collides with another unique key, the statement
+   * updates that other row, and the upsert no longer touches the row the
+   * conflict target named.
+   */
+  async #assertNoOtherUniqueConflict(
+    create: Record<string, unknown>,
+    where: WhereInput,
+    target: Record<string, unknown> | null,
+  ): Promise<void> {
+    const primary = this.#model.table.columns.find((c) => c.primaryKey);
+    for (const column of this.#uniqueColumns()) {
+      if (column in where) continue;
+      const value = create[column];
+      if (value === undefined) continue;
+      const clash = (await this.findFirst({
+        where: { [column]: value } as WhereInput,
+      })) as Record<string, unknown> | null;
+      if (!clash) continue;
+      // The clash is the row the conflict target named, so the statement
+      // updates the row the upsert was asked to update.
+      if (primary && target && clash[primary.name] === target[primary.name]) continue;
+      throw new OrmError(
+        `Cannot upsert ${this.#model.name}: the create data collides with an existing row on the unique column ${column}, which is not the conflict target`,
+      );
+    }
+  }
+
+  /** The columns of the table that hold a unique value on their own. */
+  #uniqueColumns(): string[] {
+    const compositeColumns = new Set<string>();
+    const primaryKeys = this.#model.table.columns.filter((c) => c.primaryKey);
+    if (primaryKeys.length > 1) {
+      for (const column of primaryKeys) compositeColumns.add(column.name);
+    }
+    for (const index of this.#model.table.indexes) {
+      if (!index.unique || index.columns.length < 2) continue;
+      for (const column of index.columns) compositeColumns.add(column);
+    }
+    return this.#model.table.columns
+      .filter((column) => !compositeColumns.has(column.name) && (column.primaryKey || column.unique))
+      .map((column) => column.name);
+  }
+
   #primaryKeyOf(data: Record<string, unknown>): { name: string; value: unknown } | null {
     const primary = this.#model.table.columns.find((c) => c.primaryKey);
     if (!primary) return null;
     const value = data[primary.name];
     if (value === undefined) return null;
     return { name: primary.name, value };
+  }
+
+  /** A unique column of the table whose value is known in the written data. */
+  #uniqueColumnOf(data: Record<string, unknown>): { name: string; value: unknown } | null {
+    const column = this.#model.table.columns.find(
+      (c) => c.unique && !c.primaryKey && data[c.name] !== undefined,
+    );
+    if (!column) return null;
+    return { name: column.name, value: data[column.name] };
   }
 
   /**
@@ -605,6 +880,85 @@ export class ModelDelegate<T = Record<string, unknown>> {
     }
     return encoded;
   }
+
+  /** Runs a statement and maps a driver error to an ORM error. */
+  async #all<T = Record<string, unknown>>(sql: string, params: SqlParam[]): Promise<T[]> {
+    try {
+      return await this.#db.executeAll<T>(sql, params);
+    } catch (error) {
+      throw mapDriverError(error);
+    }
+  }
+
+  /** Runs a statement and maps a driver error to an ORM error. */
+  async #run(sql: string, params: SqlParam[]): Promise<{ changes: number; lastInsertRowid: number }> {
+    try {
+      return await this.#db.executeRun(sql, params);
+    } catch (error) {
+      throw mapDriverError(error);
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Driver error mapping                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Maps a driver error to an ORM error.
+ *
+ * A unique violation becomes a `UniqueConstraintError` whose message stays
+ * generic, because the raw driver message names the column and the schema.
+ * The original error is kept as the cause for the internal log.
+ */
+export function mapDriverError(error: unknown): Error {
+  if (error instanceof OrmError) return error;
+  if (!isUniqueViolation(error)) return error instanceof Error ? error : new Error(String(error));
+
+  const mapped = new UniqueConstraintError('Unique constraint failed');
+  (mapped as { cause?: unknown }).cause = error;
+  return mapped;
+}
+
+/**
+ * Detects a unique violation across the four backends.
+ *
+ * The backend codes decide, never the free text of the message: a value that
+ * merely reads like a duplicate must not become a unique violation.
+ *
+ * - SQLite reports `SQLITE_CONSTRAINT_UNIQUE` or `SQLITE_CONSTRAINT_PRIMARYKEY`,
+ *   and its message for a unique violation always starts with
+ *   `UNIQUE constraint failed`.
+ * - PostgreSQL reports SQLSTATE `23505`.
+ * - MySQL and MariaDB report error number `1062`.
+ */
+function isUniqueViolation(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as {
+    code?: unknown;
+    errno?: unknown;
+    sqlState?: unknown;
+    message?: unknown;
+    cause?: unknown;
+  };
+
+  const code = String(candidate.code ?? '');
+  if (code === '23505') return true;
+  if (code === 'SQLITE_CONSTRAINT_UNIQUE' || code === 'SQLITE_CONSTRAINT_PRIMARYKEY') return true;
+  if (code === '1062') return true;
+
+  if (String(candidate.sqlState ?? '') === '23505') return true;
+
+  const errno = Number(candidate.errno);
+  if (errno === 1062) return true;
+
+  // SQLite reports a unique violation with a message that always starts with
+  // this text; a CHECK violation says `CHECK constraint failed` and is not one.
+  if (String(candidate.message ?? '').startsWith('UNIQUE constraint failed')) return true;
+
+  const cause = candidate.cause;
+  if (cause && cause !== error) return isUniqueViolation(cause);
+  return false;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -638,7 +992,8 @@ export class UniqueConstraintError extends OrmError {
 
 /**
  * Database facade. Models are registered up-front; each one becomes an
- * `db.<model>` delegate with the Prisma-style method set.
+ * `db.<model>` delegate with the find, create, update, upsert and delete
+ * methods.
  */
 export class Database {
   readonly #driver: Driver;

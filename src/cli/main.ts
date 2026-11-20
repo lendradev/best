@@ -17,35 +17,82 @@ import {
   resolvePath,
   writeTextFile,
 } from '../common/fs.ts';
+import type { Driver } from '../orm/driver.ts';
 
-const HELP = `best — NestJS-style framework and Prisma-style ORM for Bun
+const HELP = `best — an HTTP framework and a SQL ORM for Bun
 
 Commands:
   new <name>              Scaffold a new Best project in ./<name>
   generate <model>        Create src/models/<model>.ts from the template
-  migrate <schema.ts>     Apply the schema DDL to a SQLite database
+  migrate <schema.ts>     Apply the schema DDL to a database
   dev                     Run src/main.ts with hot reload
   start                   Run src/main.ts
 
 Options:
+  --db <file>             SQLite database file, used by \`migrate\`
+  --url <connection>      Connection string for \`migrate\`
+                           (postgres://, mysql://, mariadb://)
   --help, -h              Show this help
   --version, -v           Show the version
 `;
 
-const MODEL_TEMPLATE = `import { id, integer, table, text } from '../orm/schema.ts';
+const MIGRATE_USAGE = 'Usage: best migrate <schema.ts> (--db <file> | --url <connection-string>)';
 
-export const {TABLE} = table('{TABLE}', [
+/**
+ * Model template. The table is imported from the package subpath so the
+ * scaffolded project resolves it the same way the published package does.
+ */
+const MODEL_TEMPLATE = `import { id, integer, table, text } from 'best/orm';
+
+export const {NAME} = table('{TABLE}', [
   id(),
   text('name', { notNull: true }),
   integer('createdAt', { notNull: true }),
 ]);
 
-export type {TABLE}Row = {
+export type {ROW} = {
   id: number;
   name: string;
   createdAt: number;
 };
 `;
+
+/**
+ * Schema template — the file `best migrate` reads. `SchemaBuilder.table()`
+ * returns the builder, so the calls chain and the schema is read off
+ * `build()`.
+ */
+const SCHEMA_TEMPLATE = `import { SchemaBuilder } from 'best/orm';
+import { {NAME} } from './models/{NAME}.ts';
+
+export const schema = new SchemaBuilder()
+  .table({NAME}.name, {NAME}.columns, { indexes: {NAME}.indexes })
+  .build();
+`;
+
+/** `user` becomes `User`, for the generated row type. */
+function pascalCase(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+/**
+ * Derives a valid npm package name from the directory name. A path is reduced
+ * to its last segment, and anything that is not allowed in a package name is
+ * replaced with a dash.
+ */
+function packageName(name: string): string {
+  const segment = name.split('/').filter(Boolean).pop() ?? 'app';
+  const cleaned = segment.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^[._-]+/, '');
+  return cleaned.length > 0 ? cleaned.toLowerCase() : 'app';
+}
+
+/** Fills the placeholders of a model or schema template. */
+function fillTemplate(template: string, name: string): string {
+  return template
+    .replaceAll('{NAME}', name)
+    .replaceAll('{TABLE}', name)
+    .replaceAll('{ROW}', `${pascalCase(name)}Row`);
+}
 
 export async function run(argv: string[]): Promise<number> {
   const [command, ...args] = argv;
@@ -93,7 +140,7 @@ async function commandNew(args: string[]): Promise<number> {
     return 1;
   }
 
-  const root = joinPath(process.cwd(), name);
+  const root = name.startsWith('/') ? name : joinPath(process.cwd(), name);
   if ((await listDirectory(root)).length > 0) {
     console.error(`Directory "${name}" already exists and is not empty.`);
     return 1;
@@ -103,7 +150,7 @@ async function commandNew(args: string[]): Promise<number> {
     joinPath(root, 'package.json'),
     `${JSON.stringify(
       {
-        name,
+        name: packageName(name),
         version: '0.1.0',
         type: 'module',
         private: true,
@@ -111,8 +158,16 @@ async function commandNew(args: string[]): Promise<number> {
           dev: 'bun run --watch src/main.ts',
           start: 'bun run src/main.ts',
           test: 'bun test',
+          typecheck: 'tsc --noEmit',
+          migrate: 'bunx best migrate src/schema.ts --db app.db',
         },
-        dependencies: {},
+        dependencies: {
+          best: 'github:lendradev/best',
+        },
+        devDependencies: {
+          '@types/bun': '1.4.4',
+          typescript: '7.0.2',
+        },
       },
       null,
       2,
@@ -142,7 +197,12 @@ console.log(\`Listening on \${server.url}\`);
 
   await writeTextFile(
     joinPath(root, 'src', 'models', 'user.ts'),
-    MODEL_TEMPLATE.replaceAll('{TABLE}', 'user'),
+    fillTemplate(MODEL_TEMPLATE, 'user'),
+  );
+
+  await writeTextFile(
+    joinPath(root, 'src', 'schema.ts'),
+    fillTemplate(SCHEMA_TEMPLATE, 'user'),
   );
 
   await writeTextFile(
@@ -150,10 +210,14 @@ console.log(\`Listening on \${server.url}\`);
     `${JSON.stringify(
       {
         compilerOptions: {
+          lib: ['ESNext'],
           target: 'ESNext',
           module: 'ESNext',
           moduleResolution: 'bundler',
+          moduleDetection: 'force',
+          allowImportingTsExtensions: true,
           strict: true,
+          skipLibCheck: true,
           experimentalDecorators: true,
           types: ['bun'],
         },
@@ -168,6 +232,7 @@ console.log(\`Listening on \${server.url}\`);
 
   console.log(`Created ${name}/`);
   console.log(`  cd ${name} && bun install && bun run dev`);
+  console.log('  The "best" dependency is installed from GitHub until the npm name is released.');
   return 0;
 }
 
@@ -182,20 +247,54 @@ async function commandGenerate(args: string[]): Promise<number> {
     console.error(`Model "${model}" already exists at ${file}`);
     return 1;
   }
-  await writeTextFile(file, MODEL_TEMPLATE.replaceAll('{TABLE}', model));
+  await writeTextFile(file, fillTemplate(MODEL_TEMPLATE, model));
   console.log(`Created ${file}`);
   return 0;
 }
 
+/** Matches a connection string such as `postgres://host/db`. */
+function isConnectionUrl(value: string): boolean {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value);
+}
+
 async function commandMigrate(args: string[]): Promise<number> {
   const schemaPath = args[0];
-  if (!schemaPath) {
-    console.error('Usage: best migrate <schema.ts> [--db file]');
+  if (!schemaPath || schemaPath.startsWith('--')) {
+    console.error(MIGRATE_USAGE);
     return 1;
   }
 
   const dbIndex = args.indexOf('--db');
-  const dbFile = dbIndex >= 0 ? (args[dbIndex + 1] ?? 'best.db') : 'best.db';
+  const urlIndex = args.indexOf('--url');
+  const dbFile = dbIndex >= 0 ? args[dbIndex + 1] : undefined;
+  const url = urlIndex >= 0 ? args[urlIndex + 1] : undefined;
+
+  if (dbIndex >= 0 && (dbFile === undefined || dbFile.startsWith('--'))) {
+    console.error('--db needs a SQLite file path.');
+    console.error(MIGRATE_USAGE);
+    return 1;
+  }
+  if (urlIndex >= 0 && (url === undefined || url.startsWith('--'))) {
+    console.error('--url needs a connection string.');
+    console.error(MIGRATE_USAGE);
+    return 1;
+  }
+  if (!dbFile && !url) {
+    console.error(
+      'Choose a target: --db <file> for SQLite, --url <connection-string> for PostgreSQL, MySQL or MariaDB.',
+    );
+    console.error(MIGRATE_USAGE);
+    return 1;
+  }
+  if (dbFile && isConnectionUrl(dbFile)) {
+    console.error(`"--db ${dbFile}" is a connection string. SQLite needs a file path.`);
+    console.error('Use --url for PostgreSQL, MySQL or MariaDB.');
+    return 1;
+  }
+  if (url && url.startsWith('sqlite://')) {
+    console.error('SQLite is a local file. Use --db <file> instead of --url.');
+    return 1;
+  }
 
   const absolute = resolvePath(schemaPath);
   if (!(await fileExists(absolute))) {
@@ -203,25 +302,56 @@ async function commandMigrate(args: string[]): Promise<number> {
     return 1;
   }
 
-  const module = await import(absolute);
-  const schema = (module.schema ?? module.default) as { tables?: unknown[] };
+  let schema: { tables?: unknown[] };
+  try {
+    const module = await import(absolute);
+    schema = (module.schema ?? module.default) as { tables?: unknown[] };
+  } catch (error) {
+    console.error(`Could not load "${schemaPath}": ${errorMessage(error)}`);
+    if (errorMessage(error).includes("Cannot find package 'best'")) {
+      console.error('Run "bun install" in the project first.');
+    }
+    return 1;
+  }
   if (!schema?.tables) {
     console.error(`"${schemaPath}" must export a schema with a "tables" array.`);
     return 1;
   }
 
   const { generateMigration } = await import('../orm/migrate.ts');
-  const { SqliteDriver } = await import('../orm/driver.ts');
+  const { createDriver } = await import('../orm/driver.ts');
 
-  const migration = generateMigration(schema as never, 'manual');
-  const driver = new SqliteDriver({ file: dbFile });
-  for (const statement of migration.statements) {
-    await driver.run(statement);
+  let driver: Driver;
+  try {
+    driver = url ? createDriver({ url }) : createDriver({ file: dbFile! });
+  } catch (error) {
+    console.error(`Could not open the database: ${errorMessage(error)}`);
+    return 1;
+  }
+
+  const dialect = driver.kind;
+  const migration = generateMigration(schema as never, 'manual', dialect);
+
+  try {
+    for (const statement of migration.statements) {
+      await driver.run(statement);
+    }
+  } catch (error) {
+    console.error(`Migration failed on ${dialect}: ${errorMessage(error)}`);
+    await driver.close();
+    return 1;
   }
   await driver.close();
 
-  console.log(`Applied ${migration.statements.length} statements to ${dbFile}`);
+  const target = url ?? dbFile!;
+  console.log(
+    `Applied ${migration.statements.length} statement${migration.statements.length === 1 ? '' : 's'} to ${target} (${dialect})`,
+  );
   return 0;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function commandRun(mode: 'dev' | 'start'): Promise<number> {
@@ -235,4 +365,8 @@ async function commandRun(mode: 'dev' | 'start'): Promise<number> {
     { stdio: ['inherit', 'inherit', 'inherit'] },
   );
   return await proc.exited;
+}
+
+if (import.meta.main) {
+  process.exit(await run(process.argv.slice(2)));
 }

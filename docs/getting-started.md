@@ -18,8 +18,11 @@ bun --version
 
 ## 1. Install
 
+The npm name `best` is taken by an unrelated package, so the package is
+installed from GitHub for now:
+
 ```bash
-bun add best
+bun add github:lendradev/best
 ```
 
 To work on Best itself:
@@ -51,10 +54,15 @@ my-api/
 ├── .gitignore
 └── src/
     ├── main.ts
+    ├── schema.ts
     └── models/user.ts
 ```
 
 `src/main.ts` starts a server on port 3000 (override with `PORT`).
+
+`src/schema.ts` exports the `schema` object that `best migrate` reads. The
+scaffold writes `best` into `dependencies` as `github:lendradev/best`, so
+`bun install` inside the new project resolves it the same way.
 
 ---
 
@@ -160,7 +168,7 @@ the field.
 ## 7. Guards, interceptors and filters
 
 ```ts
-import { CanActivate, ExceptionFilter, ExecutionContext, NestInterceptor, UseGuards } from 'best';
+import { CanActivate, ExecutionContext, NestInterceptor, UseGuards } from 'best';
 
 @Injectable()
 export class AuthGuard implements CanActivate {
@@ -201,8 +209,18 @@ directly to the response status.
 ## 8. The ORM
 
 ```ts
-import { Database } from 'best/orm';
-import { id, integer, table, text } from 'best/orm';
+import {
+  Database,
+  MariadbDriver,
+  MysqlDriver,
+  PostgresDriver,
+  SqliteDriver,
+  generateMigration,
+  id,
+  integer,
+  table,
+  text,
+} from 'best/orm';
 
 export const users = table('users', [
   id(),
@@ -213,14 +231,14 @@ export const users = table('users', [
 
 const db = new Database(new SqliteDriver({ file: 'app.db' }));
 
-for (const statement of generateMigration({ tables: [users] }).statements) {
+for (const statement of generateMigration({ tables: [users], relations: [] }).statements) {
   await db.executeRun(statement);
 }
 
 const user = db.model({ name: 'user', table: users });
 
 await user.create({ data: { email: 'ada@example.com', name: 'Ada', age: 36 } });
-await user.findMany({ where: { age: { gte: 18 } }, orderBy: { column: 'name' } });
+await user.findMany({ where: { age: { gte: 18 } }, orderBy: { column: 'name', direction: 'asc' } });
 await user.aggregate({ _count: true, _avg: { age: true } });
 await db.transaction(async (tx) => {
   await tx.model({ name: 'user', table: users }).delete({ where: { id: 1 } });
@@ -259,18 +277,39 @@ const db = new Database(
 
 ## 9. Migrations from the CLI
 
+The scaffolded project has a `migrate` script that applies `src/schema.ts` to
+`app.db`:
+
 ```bash
-best migrate src/schema.ts --db app.db
+bun run migrate
 ```
 
-The schema file must export a `schema` object:
+The CLI itself takes the schema file and a target:
+
+```bash
+best migrate src/schema.ts --db app.db
+best migrate src/schema.ts --url postgres://localhost/app
+```
+
+`--db` takes a SQLite file path. `--url` takes a connection string and picks
+the backend from its scheme: `postgres://`, `mysql://` or `mariadb://`.
+
+The schema file must export a `schema` object. `SchemaBuilder.table()`
+registers a table and returns the builder, so the calls chain and the schema
+is read off `build()`:
 
 ```ts
-import { SchemaBuilder } from 'best/orm';
+import { SchemaBuilder, id, text } from 'best/orm';
 
 export const schema = new SchemaBuilder()
   .table('users', [id(), text('email', { notNull: true })])
   .build();
+```
+
+The CLI prints the number of statements it applied and the backend it used:
+
+```
+Applied 1 statement to app.db (sqlite)
 ```
 
 ---
@@ -296,6 +335,14 @@ The framework's own suite runs with `bun test`.
 |---|---|
 | `best new <name>` | Scaffold a project |
 | `best generate <model>` | Create a model file from the template |
-| `best migrate <schema.ts>` | Apply schema DDL to SQLite |
+| `best migrate <schema.ts> --db <file>` | Apply schema DDL to a SQLite file |
+| `best migrate <schema.ts> --url <connection>` | Apply schema DDL to PostgreSQL, MySQL or MariaDB |
 | `best dev` | Run `src/main.ts` with hot reload |
 | `best start` | Run `src/main.ts` |
+
+The package has no `bin` entry yet, so the CLI is reached through the source
+path in a scaffolded project:
+
+```bash
+bun run node_modules/best/src/cli/index.ts migrate src/schema.ts --db app.db
+```

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { Database } from '../src/orm/client.ts';
+import { Database, UniqueConstraintError } from '../src/orm/client.ts';
 import {
   getDialect,
   mariadbDialect,
@@ -9,6 +9,7 @@ import {
 } from '../src/orm/dialect.ts';
 import { inferAdapter, SqliteDriver } from '../src/orm/driver.ts';
 import { createTableSql, generateMigration } from '../src/orm/migrate.ts';
+import { SelectBuilder } from '../src/orm/query-builder.ts';
 import {
   countNumberedPlaceholders,
   countPlaceholders,
@@ -266,6 +267,199 @@ describe('sqlite round trip', () => {
     const db = await makeDb();
     const rows = await db.query<{ email: string }>('SELECT "email" FROM "users"');
     expect(rows).toEqual([]);
+    await db.close();
+  });
+});
+
+describe('order direction', () => {
+  test('an order direction outside the allow list is rejected', async () => {
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    const user = db.model({ name: 'user', table: users });
+    expect(
+      user.findMany({ orderBy: { column: 'id', direction: 'asc; DROP TABLE users --' as never } }),
+    ).rejects.toThrow('Invalid order direction');
+    await db.close();
+  });
+
+  test('the rejected direction never reaches the statement', () => {
+    const builder = new SelectBuilder({
+      table: 'users',
+      orderBy: [{ column: 'id', direction: 'asc; DROP TABLE users --' as never }],
+      quote: sqliteDialect.quote,
+    });
+    expect(() => builder.toSQL()).toThrow('Invalid order direction');
+  });
+
+  test('a valid direction is written as a keyword', () => {
+    const builder = new SelectBuilder({
+      table: 'users',
+      orderBy: [{ column: 'id', direction: 'desc' }],
+      quote: sqliteDialect.quote,
+    });
+    expect(builder.toSQL().sql).toBe('SELECT * FROM "users" ORDER BY "id" DESC');
+  });
+});
+
+describe('where keys', () => {
+  test('a qualified key is rejected', async () => {
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    const user = db.model({ name: 'user', table: users });
+    expect(user.findMany({ where: { 'user.name': 'A' } as never })).rejects.toThrow(
+      'Invalid where key',
+    );
+    await db.close();
+  });
+
+  test('an already quoted key is rejected', async () => {
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    const user = db.model({ name: 'user', table: users });
+    expect(user.findMany({ where: { '"name"': 'A' } as never })).rejects.toThrow(
+      'Invalid where key',
+    );
+    await db.close();
+  });
+});
+
+describe('unique violations', () => {
+  test('a duplicate insert throws a UniqueConstraintError', async () => {
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    for (const statement of generateMigration({ tables: [users], relations: [] }).statements) {
+      await db.executeRun(statement);
+    }
+    const user = db.model({ name: 'user', table: users });
+    await user.create({ data: { email: 'dup@example.com', name: 'A' } });
+
+    let thrown: unknown;
+    try {
+      await user.create({ data: { email: 'dup@example.com', name: 'B' } });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(UniqueConstraintError);
+    expect((thrown as Error).message).toBe('Unique constraint failed');
+    // The raw driver message names the column, so it stays in the cause.
+    expect(((thrown as { cause?: Error }).cause)?.message).toContain('UNIQUE constraint failed');
+    await db.close();
+  });
+
+  test('a primary key violation throws a UniqueConstraintError', async () => {
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    for (const statement of generateMigration({ tables: [users], relations: [] }).statements) {
+      await db.executeRun(statement);
+    }
+    const user = db.model({ name: 'user', table: users });
+    await user.create({ data: { email: 'dup@example.com', name: 'A' } });
+
+    let thrown: unknown;
+    try {
+      await user.create({ data: { id: 1, email: 'other@example.com', name: 'B' } });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(UniqueConstraintError);
+    await db.close();
+  });
+
+  test('a check constraint violation is not a UniqueConstraintError', async () => {
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    // The rejected value reads like a duplicate, but the failure is a check
+    // constraint and must not be reported as a unique violation.
+    await db.executeRun(
+      "CREATE TABLE \"checked\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"name\" TEXT CHECK (name <> 'Duplicate entry'))",
+    );
+    const checked = db.model({
+      name: 'checked',
+      table: {
+        name: 'checked',
+        columns: [
+          { name: 'id', type: 'integer', primaryKey: true, autoIncrement: true },
+          { name: 'name', type: 'text' },
+        ],
+        indexes: [],
+      },
+    });
+
+    let thrown: unknown;
+    try {
+      await checked.create({ data: { name: 'Duplicate entry' } });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(UniqueConstraintError);
+    expect((thrown as Error).message).toContain('CHECK constraint failed');
+    await db.close();
+  });
+});
+
+describe('tables without a primary key', () => {
+  const notes = table('notes', [
+    text('body', { notNull: true, unique: true }),
+    integer('level', { default: 7 }),
+  ]);
+
+  test('create returns the row the database stored, defaults included', async () => {
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    for (const statement of generateMigration({ tables: [notes], relations: [] }).statements) {
+      await db.executeRun(statement);
+    }
+    const note = db.model({ name: 'note', table: notes });
+    const created = await note.create({ data: { body: 'hello' } });
+    expect(created.body).toBe('hello');
+    expect(created.level).toBe(7);
+    await db.close();
+  });
+
+  test('create on SQLite returns the row the database stored', async () => {
+    const plain = table('plain', [text('body', { notNull: true })]);
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    for (const statement of generateMigration({ tables: [plain], relations: [] }).statements) {
+      await db.executeRun(statement);
+    }
+    const model = db.model({ name: 'plain', table: plain });
+    const created = await model.create({ data: { body: 'hello' } });
+    expect(created.body).toBe('hello');
+    await db.close();
+  });
+
+  test('update returns the row instead of failing after the write', async () => {
+    const plain = table('plain', [text('body', { notNull: true }), integer('level')]);
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    for (const statement of generateMigration({ tables: [plain], relations: [] }).statements) {
+      await db.executeRun(statement);
+    }
+    const model = db.model({ name: 'plain', table: plain });
+    await db.executeRun("INSERT INTO \"plain\" (\"body\", \"level\") VALUES ('hello', 1)");
+
+    // The update writes no column of the where clause, so the row cannot be
+    // looked up afterwards. The write succeeded, so the update must report
+    // the row instead of an error.
+    const updated = await model.update({ where: { body: 'hello' }, data: { level: 5 } });
+    expect(updated.level).toBe(5);
+
+    const stored = await model.findFirst({ where: { body: 'hello' } });
+    expect(stored?.level).toBe(5);
+    await db.close();
+  });
+
+  test('update with an operator where returns the row instead of failing', async () => {
+    const plain = table('plain', [text('body', { notNull: true }), integer('level')]);
+    const db = new Database(new SqliteDriver({ file: ':memory:' }));
+    for (const statement of generateMigration({ tables: [plain], relations: [] }).statements) {
+      await db.executeRun(statement);
+    }
+    const model = db.model({ name: 'plain', table: plain });
+    await db.executeRun("INSERT INTO \"plain\" (\"body\", \"level\") VALUES ('hello', 30)");
+
+    const updated = await model.update({ where: { level: { gt: 5 } }, data: { body: 'world' } });
+    expect(updated.body).toBe('world');
+    expect(updated.level).toBe(30);
+
+    const stored = await model.findFirst({ where: { body: 'world' } });
+    expect(stored?.level).toBe(30);
     await db.close();
   });
 });

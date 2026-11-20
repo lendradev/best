@@ -3,6 +3,7 @@
  */
 
 import type { Application } from '../application.ts';
+import { NotFoundError, UniqueConstraintError } from '../orm/client.ts';
 import { createRequestContext } from './context.ts';
 import { HttpException } from './contracts.ts';
 
@@ -20,9 +21,15 @@ export interface RunningServer {
   stop(): Promise<void>;
 }
 
-function errorBody(error: unknown): { status: number; body: unknown } {
+export function errorBody(error: unknown): { status: number; body: unknown } {
   if (error instanceof HttpException) {
     return { status: error.status, body: error.response };
+  }
+  if (error instanceof NotFoundError) {
+    return { status: 404, body: { statusCode: 404, message: error.message } };
+  }
+  if (error instanceof UniqueConstraintError) {
+    return { status: 409, body: { statusCode: 409, message: error.message } };
   }
   return {
     status: 500,

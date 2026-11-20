@@ -10,10 +10,10 @@ tags: [architecture, bun, framework, orm]
 
 Best is two libraries in one repository:
 
-| Library | Purpose | Nest/Prisma analogue |
-|---|---|---|
-| `best` (core) | HTTP application framework: modules, DI, routing, cross-cutting concerns | NestJS |
-| `best/orm` | Data access layer: schema, query builder, migrations | Prisma ergonomics + Drizzle SQL transparency |
+| Library | Purpose |
+|---|---|
+| `best` (core) | HTTP application framework: modules, DI, routing, cross-cutting concerns |
+| `best/orm` | Data access layer: schema, query builder, migrations |
 
 Both run **natively on Bun** with **zero runtime dependencies**. No `node:` builtins, no Deno APIs, no third-party packages at runtime.
 
@@ -52,9 +52,9 @@ src/
 
 ### 2.2 Dependency injection
 
-Bun's transpiler does **not** implement `emitDecoratorMetadata`, so Nest's
-type-based constructor injection is impossible without `reflect-metadata`.
-Best therefore uses **explicit tokens**:
+Bun's transpiler does **not** implement `emitDecoratorMetadata`, so a
+constructor parameter cannot be resolved by its type alone. Best therefore
+uses **explicit tokens**:
 
 ```ts
 @Injectable()
@@ -96,7 +96,7 @@ every other method of the same controller.
 
 ### 2.4 Request pipeline
 
-Order, matching Nest semantics:
+Order of execution:
 
 ```
 middleware → guards → interceptors (pre) → pipes → handler
@@ -106,8 +106,8 @@ errors   → filters (route → controller → global)
 
 Guards that return `false` short-circuit with `403`.
 
-Interceptors are plain async functions (`intercept(context, next)`), not RxJS
-observables — Bun has no need for the RxJS dependency.
+Interceptors are plain async functions (`intercept(context, next)`). There is
+no observable type in the pipeline, and no dependency to provide one.
 
 ### 2.5 Routing
 
@@ -119,8 +119,8 @@ prefix is prepended to the controller prefix and the route path.
 
 ### 2.6 Validation
 
-`ValidationPipe` takes a plain rule object — no `class-validator`, no DTO
-classes:
+`ValidationPipe` takes a plain rule object. There are no DTO classes and no
+validation library:
 
 ```ts
 @BodyPiped(new ValidationPipe({
@@ -189,8 +189,7 @@ Where operators: `equals`, `not`, `in`, `notIn`, `gt`, `gte`, `lt`, `lte`,
 The ORM compiles to SQL through an explicit builder chain (`SelectBuilder`,
 `InsertBuilder`, `UpdateBuilder`, `DeleteBuilder`) and a `SQL` fragment type.
 Every builder exposes `toSQL()` returning `{ sql, params }`, so the generated
-statement is inspectable — the Drizzle property — while the call sites keep the
-Prisma shape.
+statement is inspectable before it reaches the database.
 
 ### 3.4 Drivers and dialects
 
@@ -240,12 +239,12 @@ returned under `manual` rather than attempted.
 
 ### 3.6 Not yet implemented
 
-The following Prisma features are **not** in the current scope and are tracked
-as follow-up work:
+These features are **not** in the current scope and are tracked as follow-up
+work:
 
 - Relation loading (`include` / `select` on relation fields) and nested writes.
 - `groupBy`.
-- `Prisma Studio` equivalent GUI.
+- A graphical schema browser.
 
 ---
 
@@ -253,11 +252,11 @@ as follow-up work:
 
 | Decision | Reason | Cost |
 |---|---|---|
-| Explicit `@Inject` tokens | Bun has no `emitDecoratorMetadata` | More verbose than Nest's type-based injection |
-| No RxJS | Interceptors as plain async functions | No observable composition in interceptors |
-| No `reflect-metadata` | Bun has no metadata reflection | Hand-written metadata store (~60 lines) |
+| Explicit `@Inject` tokens | Bun has no `emitDecoratorMetadata` | Every dependency must name its token |
+| Interceptors as plain async functions | No observable type is needed to wrap a handler | No observable composition in interceptors |
+| No metadata polyfill | Bun has no metadata reflection | Hand-written metadata store (~60 lines) |
 | `Bun.write` / `Bun.file` instead of `node:fs` | Keeps the runtime surface Bun-only | No `mkdir` primitive; `Bun.write` creates parents |
-| SQL builders over a query compiler | Inspectable SQL, no engine, Drizzle-level speed | Less automatic relation handling |
+| SQL builders over a query compiler | Inspectable SQL, no engine process | Less automatic relation handling |
 | A dialect object per backend | One query layer for four backends, no `if (postgres)` in the code | A new backend means a new dialect |
 | Portable `?` placeholders, rendered by the driver | The query layer never branches on the backend | A hand-written statement has to use `?`, not `$1` |
 | `RETURNING` for writes where the backend has it | One round trip per write | MySQL needs a read-back; PostgreSQL needs >= 8.2 |
@@ -274,8 +273,7 @@ as follow-up work:
 3. **Request-scoped providers need an explicit child container.** The HTTP
    layer currently uses the application container for every request.
 4. **Middleware is declared but not executed.** The `UseMiddleware` decorator
-   and the `MiddlewareConsumer` concept from Nest are not wired into the
-   request pipeline yet.
+   is exported, but it is not wired into the request pipeline yet.
 5. **No WebSocket, GraphQL, microservice or OpenAPI support.**
 6. **MySQL and MariaDB count the rows that changed.** The ORM compensates by
    counting the matching rows itself, which costs one extra query on
@@ -289,6 +287,4 @@ as follow-up work:
 ## 6. Sources
 
 - Bun documentation: <https://bun.com/docs>
-- NestJS reference: <https://docs.nestjs.com>
-- Prisma reference: <https://www.prisma.io/docs>
-- Drizzle reference: <https://orm.drizzle.team/docs>
+- Bun SQL documentation: <https://bun.com/docs/sql>

@@ -50,6 +50,11 @@ export class Logger {
     if (this.isLevelEnabled('log')) this.#sink('log', message, meta);
   }
 
+  /** Alias of `log`, for callers that use the conventional logger naming. */
+  info(message: string, ...meta: unknown[]): void {
+    this.log(message, ...meta);
+  }
+
   warn(message: string, ...meta: unknown[]): void {
     if (this.isLevelEnabled('warn')) this.#sink('warn', message, meta);
   }

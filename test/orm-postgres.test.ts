@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { Database } from '../src/orm/client.ts';
+import { Database, UniqueConstraintError } from '../src/orm/client.ts';
 import { PostgresDriver } from '../src/orm/driver.ts';
 import { generateMigration } from '../src/orm/migrate.ts';
 import { boolean, id, integer, table, text } from '../src/orm/schema.ts';
@@ -148,6 +148,67 @@ describeIfDatabase('postgres integration', () => {
       update: { name: 'Updated' },
     });
     expect(updated.name).toBe('Updated');
+    await db.close();
+  });
+
+  test('upsert rejects a conflict target that is not a unique key', async () => {
+    const db = await makeDb();
+    const user = db.model({ name: 'user', table: users });
+    await expect(
+      user.upsert({
+        where: { name: 'Dup' },
+        create: { email: 'dup@example.com', name: 'Dup' },
+        update: { age: 1 },
+      }),
+    ).rejects.toThrow('is not a unique key');
+    await db.close();
+  });
+
+  test('update reads the row back when the update changes the where column', async () => {
+    const db = await makeDb();
+    const user = db.model({ name: 'user', table: users });
+    await user.create({ data: { email: 'ada@example.com', name: 'Ada' } });
+    const updated = await user.update({
+      where: { name: 'Ada' },
+      data: { name: 'Ada L.' },
+    });
+    expect(updated.name).toBe('Ada L.');
+    await db.close();
+  });
+
+  test('a duplicate insert throws a UniqueConstraintError', async () => {
+    const db = await makeDb();
+    const user = db.model({ name: 'user', table: users });
+    await user.create({ data: { email: 'dup@example.com', name: 'First' } });
+
+    let thrown: unknown;
+    try {
+      await user.create({ data: { email: 'dup@example.com', name: 'Second' } });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(UniqueConstraintError);
+    expect((thrown as Error).message).toBe('Unique constraint failed');
+    await db.close();
+  });
+
+  test('upsert that changes the conflict target is rejected before the write', async () => {
+    const db = await makeDb();
+    const user = db.model({ name: 'user', table: users });
+    await user.create({ data: { email: 'a@example.com', name: 'Ada' } });
+
+    await expect(
+      user.upsert({
+        where: { email: 'a@example.com' },
+        create: { email: 'a@example.com', name: 'New' },
+        update: { email: 'b@example.com' },
+      }),
+    ).rejects.toThrow('the update changes the conflict target');
+
+    const rows = await user.findMany({ where: { email: 'a@example.com' } });
+    expect(rows.length).toBe(1);
+    expect(rows[0].name).toBe('Ada');
     await db.close();
   });
 

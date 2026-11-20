@@ -1,5 +1,5 @@
 /**
- * Query builder — Drizzle-style, SQL-emitting.
+ * Query builder — inspectable SQL.
  *
  * Identifiers are quoted with the dialect's quoting rules. Callers that do not
  * pass a `quote` function get the identifiers verbatim, which is what the
@@ -9,6 +9,26 @@
 import { SQL, type SqlParam, normalizeParam } from './sql.ts';
 
 export type OrderDirection = 'asc' | 'desc';
+
+/** The only order directions that are written into a statement as a keyword. */
+export const ORDER_DIRECTIONS: readonly OrderDirection[] = ['asc', 'desc'];
+
+/**
+ * Validates an order direction.
+ *
+ * The direction is written into the statement as a bare keyword, so a value
+ * outside the allow list has to be rejected instead of being upper-cased into
+ * the statement.
+ */
+export function assertOrderDirection(direction: unknown): OrderDirection {
+  const normalized = typeof direction === 'string' ? direction.toLowerCase() : '';
+  if (!ORDER_DIRECTIONS.includes(normalized as OrderDirection)) {
+    throw new Error(
+      `Invalid order direction ${JSON.stringify(direction)}; expected "asc" or "desc"`,
+    );
+  }
+  return normalized as OrderDirection;
+}
 
 /** Quotes an identifier for the target dialect. */
 export type Quote = (identifier: string) => string;
@@ -57,7 +77,7 @@ export class SelectBuilder {
   orderBy(column: string, direction: OrderDirection = 'asc'): SelectBuilder {
     return new SelectBuilder({
       ...this.#options,
-      orderBy: [...(this.#options.orderBy ?? []), { column, direction }],
+      orderBy: [...(this.#options.orderBy ?? []), { column, direction: assertOrderDirection(direction) }],
     });
   }
 
@@ -105,7 +125,7 @@ export class SelectBuilder {
 
     if (this.#options.orderBy?.length) {
       sql += ` ORDER BY ${this.#options.orderBy
-        .map((o) => `${quote ? quote(o.column) : o.column} ${o.direction.toUpperCase()}`)
+        .map((o) => `${quote ? quote(o.column) : o.column} ${assertOrderDirection(o.direction).toUpperCase()}`)
         .join(', ')}`;
     }
 

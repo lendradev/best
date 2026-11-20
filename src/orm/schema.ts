@@ -130,21 +130,24 @@ export function relation(definition: RelationDefinition): RelationDefinition {
   return definition;
 }
 
-/** Collects table and relation definitions into a schema. */
+/**
+ * Collects table and relation definitions into a schema.
+ *
+ * `table()` and `relation()` return the builder, so the calls chain. The
+ * definitions themselves come out of `build()`.
+ */
 export class SchemaBuilder {
   readonly #tables: TableDefinition[] = [];
   readonly #relations: RelationDefinition[] = [];
 
-  table(...args: [string, ColumnDefinition[], TableOptions?]): TableDefinition {
-    const def = table(...args);
-    this.#tables.push(def);
-    return def;
+  table(...args: [string, ColumnDefinition[], TableOptions?]): this {
+    this.#tables.push(table(...args));
+    return this;
   }
 
-  relation(...args: [RelationDefinition]): RelationDefinition {
-    const def = relation(...args);
-    this.#relations.push(def);
-    return def;
+  relation(...args: [RelationDefinition]): this {
+    this.#relations.push(relation(...args));
+    return this;
   }
 
   build(): SchemaDefinition {

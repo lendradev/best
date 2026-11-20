@@ -1,6 +1,6 @@
 /**
- * Best — a NestJS-style application framework and a Prisma-style ORM,
- * built natively on Bun with zero runtime dependencies.
+ * Best — an HTTP application framework and a SQL ORM, built natively on Bun
+ * with zero runtime dependencies.
  */
 
 export { Application } from './application.ts';

@@ -1,6 +1,6 @@
 /**
- * Nest-like factory: `createApp` for HTTP servers, `createContext` for
- * headless (non-HTTP) applications.
+ * Factory: `createApp` for HTTP servers, `createContext` for headless
+ * (non-HTTP) applications.
  */
 
 import { Application, type AppOptions } from './application.ts';

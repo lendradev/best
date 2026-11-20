@@ -162,7 +162,6 @@ interface NestInterceptor {
 
 Interceptors run in declaration order on the way in and reverse order on the
 way out.
-
 ### `PipeTransform`
 
 ```ts
@@ -266,8 +265,8 @@ logger.info('started');
 logger.child('db').warn('slow query');
 ```
 
-Levels: `debug`, `log`, `warn`, `error`, `fatal`. A `sink` option redirects
-output, which is what the tests use.
+Levels: `debug`, `log`, `warn`, `error`, `fatal`. `info` is an alias of `log`.
+A `sink` option redirects output, which is what the tests use.
 
 ### `ConfigService`
 
@@ -387,6 +386,19 @@ backend stores it as.
 `uuid()`, `primaryKey()`, `references()`, `index()`, `relation()`,
 `SchemaBuilder`.
 
+`SchemaBuilder` collects tables and relations into a `SchemaDefinition`.
+`table()` and `relation()` register a definition and return the builder, so
+the calls chain:
+
+```ts
+const schema = new SchemaBuilder()
+  .table('users', [id(), text('email', { notNull: true })])
+  .build();
+```
+
+`SchemaDefinition` has two required fields: `tables: TableDefinition[]` and
+`relations: RelationDefinition[]`.
+
 ### SQL helpers
 
 `SQL.raw`, `SQL.tagged`, `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `like`,
@@ -402,8 +414,45 @@ render the DDL for another backend.
 `diffSchema(schema, driver)` returns `{ createTables, addColumns, manual }`.
 
 `createTableSql(table, dialect?)` renders a single `CREATE TABLE` statement.
-`createIndexSql(table, dialect?)` renders the index statements.
 `formatDefault(value, dialect?)` renders a default value as a SQL literal.
+
+### Query builder types
+
+| Export | Description |
+|---|---|
+| `OrderBy` | `{ column: string; direction: OrderDirection }` |
+| `OrderDirection` | `'asc' \| 'desc'` |
+| `Quote` | `(identifier: string) => string` — quotes an identifier for a dialect |
+| `SelectOptions` | Options accepted by `SelectBuilder` |
+| `JoinSpec` | A join in a select builder |
+
+`direction` is required. `asc` is the default for the builder's
+`orderBy(column, direction?)` method, but the `OrderBy` object itself has no
+default.
+
+### Dialect types
+
+| Export | Description |
+|---|---|
+| `Dialect` | The interface a backend dialect implements |
+| `DialectName` | `'sqlite' \| 'postgres' \| 'mysql' \| 'mariadb'` |
+| `UpsertOptions` | `{ table, values, conflictColumns, update }` — the input of `Dialect.upsert` |
+
+### Driver types
+
+| Export | Description |
+|---|---|
+| `Driver` | The interface every driver implements: `all`, `get`, `run`, `transaction`, `close` |
+| `DriverOptions` | Options for `createDriver` — a SQLite file or a connection URL |
+| `SqliteDriverOptions` | `{ file, readonly, create, strict, safeIntegers }` |
+| `SqlDriverOptions` | `{ url, max, allowPublicKeyRetrieval, tls }` — used by the PostgreSQL, MySQL and MariaDB drivers |
+
+```ts
+createDriver({ file: 'app.db' });                      // SQLite
+createDriver({ url: 'postgres://localhost/app' });      // PostgreSQL
+createDriver({ url: 'mysql://localhost/app' });         // MySQL
+createDriver({ url: 'mariadb://localhost/app' });       // MariaDB
+```
 
 ### Errors
 
