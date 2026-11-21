@@ -257,13 +257,51 @@ SQLite, `information_schema` for PostgreSQL and `INFORMATION_SCHEMA` for
 MySQL and MariaDB. Statements that cannot be applied automatically are
 returned under `manual` rather than attempted.
 
-### 3.6 Not yet implemented
+### 3.6 Relations
+
+A relation is declared with the foreign key side first:
+
+```ts
+relation({
+  name: 'author',
+  fromTable: 'posts',
+  fromColumn: 'userId',
+  toTable: 'users',
+  toColumn: 'id',
+  kind: 'many-to-one',
+});
+```
+
+`fromTable.fromColumn` holds the foreign key and points at `toTable.toColumn`.
+The same declaration serves both sides: resolved for `posts` the row holds one
+`author`, resolved for `users` the row holds a list of `posts`.
+
+A relation is loaded with a **second query**, not with a join. A join
+multiplies the rows, so `take` and `skip` would count the joined rows instead
+of the parent rows. The keys of the parent rows are collected first and the
+related rows are fetched in one statement, so the load costs one query per
+relation and never one per row.
+
+The related rows are attached to the parent rows by the key they carry. A
+relation whose key column was not selected is reported, rather than loaded as
+an empty relation.
+
+A nested write runs in one transaction. The parent is written first, because
+the relation needs its key. The relation supports `create`, `connect` and
+`disconnect`; it does not update the related rows.
+
+### 3.7 Grouping
+
+`groupBy` groups the rows by one or more columns and aggregates over each
+group. The group columns are selected next to the aggregates, so a group is
+one row. The aggregate is aliased with its name, which is portable across the
+four backends, so no dialect-specific handling is needed.
+
+### 3.8 Not yet implemented
 
 These features are **not** in the current scope and are tracked as follow-up
 work:
 
-- Relation loading (`include` / `select` on relation fields) and nested writes.
-- `groupBy`.
 - A graphical schema browser.
 
 ---
@@ -426,6 +464,11 @@ controller name becomes the tag.
 | A member without dependencies is instantiated directly | A middleware or a guard does not have to be listed in the module | A member with dependencies has to be a provider |
 | Every request gets its own child container | Two requests never share a request-scoped instance | The container is allocated per request |
 | The container decides whether a controller is request-scoped | The controller holds the instance, so the decision has to follow the dependencies | The check walks the dependency graph once per controller |
+| A relation is loaded with a second query | A join multiplies the rows, so `take` and `skip` would count the joined rows | The load costs one query per relation |
+| The relation keys are fetched in one statement | A query per row is an N+1 | The keys are collected from the parent rows first |
+| A relation is declared with the foreign key side first | The declaration then serves both sides of the relation | The direction is decided by the table the relation is loaded on |
+| A nested write runs in one transaction | The parent and its relation have to succeed or fail together | A failing relation write rolls the parent write back |
+| `disconnect` clears the foreign key | The related row stays, only the link is gone | The foreign key column has to be nullable |
 
 ---
 

@@ -342,6 +342,84 @@ const db = new Database(
 );
 ```
 
+### Relations
+
+A relation is declared with the foreign key side first: `fromTable.fromColumn`
+points at `toTable.toColumn`.
+
+```ts
+import { relation } from 'best/orm';
+
+export const posts = table('posts', [
+  id(),
+  text('title', { notNull: true }),
+  integer('userId'),
+]);
+
+export const userPosts = relation({
+  name: 'posts',
+  fromTable: 'posts',
+  fromColumn: 'userId',
+  toTable: 'users',
+  toColumn: 'id',
+  kind: 'one-to-many',
+});
+
+const user = db.model({ name: 'user', table: users, relations: [userPosts] });
+```
+
+The relation is loaded with `include`. It is fetched with a second query, so
+`take` and `skip` count the parent rows and not the joined rows:
+
+```ts
+const users = await user.findMany({ include: { posts: true } });
+const filtered = await user.findMany({
+  include: { posts: { where: { title: { contains: 'bun' } } } },
+});
+const picked = await user.findMany({
+  include: { posts: { select: { title: true } } },
+});
+```
+
+A relation can also be written together with its parent:
+
+```ts
+const created = await user.create({
+  data: {
+    email: 'ada@example.com',
+    name: 'Ada',
+    posts: { create: [{ title: 'First' }] },
+  },
+});
+
+await user.update({
+  where: { id: 1 },
+  data: { posts: { connect: [{ id: 2 }] } },
+});
+```
+
+The write runs in one transaction, so a failing relation write rolls the
+parent write back. `disconnect` clears the foreign key, so the column has to
+be nullable.
+
+### Grouping
+
+`groupBy` groups the rows and aggregates over each group:
+
+```ts
+const groups = await order.groupBy({
+  by: 'status',
+  _count: true,
+  _sum: { total: true },
+});
+```
+
+The result is one row per group:
+
+```ts
+[{ group: { status: 'paid' }, _count: 3, _sum: { total: 450 } }]
+```
+
 ---
 
 ## 11. Migrations from the CLI

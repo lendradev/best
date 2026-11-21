@@ -1,6 +1,6 @@
 {
   "name": "best",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": false,
   "description": "Best — an HTTP application framework and a SQL ORM, built natively on Bun with zero runtime dependencies.",
   "type": "module",

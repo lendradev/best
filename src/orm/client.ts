@@ -42,6 +42,12 @@ import {
   normalizeParam,
   type SqlParam,
 } from './sql.ts';
+import {
+  buildRelationQuery,
+  resolveRelation,
+  whereCondition,
+  type ResolvedRelation,
+} from './relations.ts';
 import type { RelationDefinition, TableDefinition } from './schema.ts';
 
 /* -------------------------------------------------------------------------- */
@@ -79,14 +85,33 @@ export type WhereInput = Record<string, WhereValue>;
 export interface FindManyArgs {
   where?: WhereInput;
   orderBy?: OrderBy | OrderBy[];
-  select?: string[];
+  select?: string[] | SelectShape;
   take?: number;
   skip?: number;
+  include?: IncludeShape;
 }
+
+/**
+ * The columns of a model and of its relations.
+ *
+ * A plain column name picks that column of the model. A relation name picks
+ * the columns of that relation.
+ */
+export type SelectShape = Record<string, boolean | { select?: SelectShape }>;
+
+export interface RelationInclude {
+  /** The columns of the relation. Every column when absent. */
+  select?: SelectShape;
+  /** A filter on the relation. */
+  where?: WhereInput;
+}
+
+export type IncludeShape = Record<string, boolean | RelationInclude>;
 
 export interface FindUniqueArgs {
   where: WhereInput;
-  select?: string[];
+  select?: string[] | SelectShape;
+  include?: IncludeShape;
 }
 
 export interface FindFirstArgs extends FindManyArgs {}
@@ -130,6 +155,44 @@ export interface DeleteManyArgs {
 export interface CountArgs {
   where?: WhereInput;
 }
+
+export interface GroupByArgs {
+  /** The columns the rows are grouped by. */
+  by: string | string[];
+  where?: WhereInput;
+  orderBy?: OrderBy | OrderBy[];
+  _count?: boolean;
+  _sum?: Record<string, true>;
+  _avg?: Record<string, true>;
+  _min?: Record<string, true>;
+  _max?: Record<string, true>;
+}
+
+export interface GroupByResult {
+  /** The value of every group column, keyed by the column name. */
+  group: Record<string, unknown>;
+  _count: number;
+  _sum: Record<string, number | null>;
+  _avg: Record<string, number | null>;
+  _min: Record<string, number | null>;
+  _max: Record<string, number | null>;
+}
+
+/**
+ * A nested write of a relation.
+ *
+ * `create` inserts the related rows, `connect` links the rows that already
+ * exist and `disconnect` unlinks them without deleting them.
+ */
+export interface NestedWrite {
+  create?: Record<string, unknown>[];
+  connect?: Record<string, unknown>[];
+  disconnect?: Record<string, unknown>[];
+}
+
+export type NestedData = Record<string, unknown> & {
+  [relation: string]: NestedWrite | undefined;
+};
 
 export interface AggregateArgs {
   where?: WhereInput;
@@ -278,12 +341,158 @@ export class ModelDelegate<T = Record<string, unknown>> {
     return this.#model.table.name;
   }
 
+  /** The name of the primary key of the table, when it has one. */
+  get primaryKeyColumn(): string | undefined {
+    return this.#model.table.columns.find((column) => column.primaryKey)?.name;
+  }
+
   /* ---------------------------------- read --------------------------------- */
+
+  /**
+   * The columns of the parent table.
+   *
+   * A plain column list is used as it is. A select shape is split: the
+   * names that are columns of this table become the column list, and the
+   * names that are relations are left to the relation loader.
+   */
+  #parentColumns(select: string[] | SelectShape | undefined): string[] | undefined {
+    if (!select) return undefined;
+    if (Array.isArray(select)) return select;
+
+    const columns: string[] = [];
+    for (const [name, value] of Object.entries(select)) {
+      if (value === false) continue;
+      if (this.#isRelationName(name)) continue;
+      columns.push(name);
+    }
+    return columns.length > 0 ? columns : undefined;
+  }
+
+  /** Whether the name is a relation of this model. */
+  #isRelationName(name: string): boolean {
+    const relations = this.#db.relationsOf(this.#model);
+    return relations.some((relation) => relation.definition.name === name);
+  }
+
+  /**
+   * Loads the relations of the parent rows.
+   *
+   * One query per relation, never one per row: the keys of the parent rows
+   * are collected first and fetched in a single statement.
+   */
+  async #loadRelations(
+    rows: Record<string, unknown>[],
+    args: { include?: IncludeShape; select?: string[] | SelectShape },
+  ): Promise<Record<string, unknown>[]> {
+    if (!args.include || rows.length === 0) return rows;
+
+    const relations = this.#db.relationsOf(this.#model);
+
+    for (const [name, option] of Object.entries(args.include)) {
+      if (option === false) continue;
+      const relation = relations.find((candidate) => candidate.definition.name === name);
+      if (!relation) {
+        throw new OrmError(
+          `The model ${this.#model.name} has no relation named "${name}"`,
+        );
+      }
+
+      const settings: RelationInclude = option === true ? {} : option;
+      const columns = this.#relationColumns(relation, settings.select, args.select);
+
+      // The key of the parent has to be present, or the relation cannot be
+      // attached to the rows.
+      const keyColumn = relation.parentKeyColumn;
+      const hasKey = rows.some((row) => row[keyColumn] !== undefined);
+      if (!hasKey) {
+        throw new OrmError(
+          `The relation "${name}" needs the column "${keyColumn}" of ${this.#model.name}, but it was not selected`,
+        );
+      }
+
+      const keys = rows.map((row) => row[keyColumn]);
+      const plan = buildRelationQuery(
+        relation,
+        keys,
+        settings.where,
+        columns,
+        this.#db.dialect,
+      );
+      const related = plan.sql
+        ? await this.#db.executeAll<Record<string, unknown>>(plan.sql, plan.params)
+        : [];
+
+      this.#attachRelation(rows, relation, related, plan);
+    }
+
+    return rows;
+  }
+
+  /**
+   * The columns of a relation.
+   *
+   * The select of the relation wins. The select of the parent may also name
+   * the relation, so both are read.
+   */
+  #relationColumns(
+    relation: ResolvedRelation,
+    includeSelect: SelectShape | undefined,
+    parentSelect: string[] | SelectShape | undefined,
+  ): string[] | undefined {
+    const fromInclude = this.#shapeColumns(includeSelect);
+    if (fromInclude) return fromInclude;
+
+    if (!parentSelect || Array.isArray(parentSelect)) return undefined;
+    const entry = parentSelect[relation.definition.name];
+    if (!entry || entry === true) return undefined;
+    return this.#shapeColumns((entry as { select?: SelectShape }).select);
+  }
+
+  /** The columns of a select shape. */
+  #shapeColumns(shape: SelectShape | undefined): string[] | undefined {
+    if (!shape) return undefined;
+    const columns: string[] = [];
+    for (const [name, value] of Object.entries(shape)) {
+      if (value === false) continue;
+      if (typeof value === 'object' && value.select) continue;
+      columns.push(name);
+    }
+    return columns.length > 0 ? columns : undefined;
+  }
+
+  /**
+   * Attaches the related rows to the parent rows.
+   *
+   * A to-one relation puts the row on the parent. A to-many relation puts
+   * the rows in an array.
+   */
+  #attachRelation(
+    rows: Record<string, unknown>[],
+    relation: ResolvedRelation,
+    related: Record<string, unknown>[],
+    plan: { parentKeyInRow: string | null; relatedKeyInRow: string },
+  ): void {
+    // The related rows are indexed by the key they carry. For a to-one
+    // relation that is the key of the related row, which the parent row
+    // points at. For a many-to-many it is the key the join table carries.
+    const index = new Map<string, Record<string, unknown>[]>();
+    for (const row of related) {
+      const key = String(plan.parentKeyInRow ? row[plan.parentKeyInRow] : row[plan.relatedKeyInRow]);
+      const list = index.get(key) ?? [];
+      list.push(row);
+      index.set(key, list);
+    }
+
+    for (const row of rows) {
+      const matched = index.get(String(row[relation.parentKeyColumn])) ?? [];
+      row[relation.definition.name] = relation.toOne ? (matched[0] ?? null) : matched;
+    }
+  }
 
   async findMany(args: FindManyArgs = {}): Promise<T[]> {
     const builder = new SelectBuilder({
       table: this.#model.table.name,
-      columns: args.select,
+      columns: this.#parentColumns(args.select),
       where: compileWhere(args.where, this.#db.dialect),
       orderBy: normalizeOrderBy(args.orderBy),
       limit: args.take,
@@ -292,7 +501,9 @@ export class ModelDelegate<T = Record<string, unknown>> {
     });
     const { sql, params } = builder.toSQL();
     const rows = await this.#db.executeAll<Record<string, unknown>>(sql, params);
-    return rows.map((row) => this.#decode(row)) as T[];
+    const decoded = rows.map((row) => this.#decode(row));
+    const loaded = await this.#loadRelations(decoded, args);
+    return loaded as T[];
   }
 
   async findFirst(args: FindFirstArgs = {}): Promise<T | null> {
@@ -309,14 +520,16 @@ export class ModelDelegate<T = Record<string, unknown>> {
   async findUnique(args: FindUniqueArgs): Promise<T | null> {
     const builder = new SelectBuilder({
       table: this.#model.table.name,
-      columns: args.select,
+      columns: this.#parentColumns(args.select),
       where: compileWhere(args.where, this.#db.dialect),
       limit: 1,
       quote: this.#db.dialect.quote,
     });
     const { sql, params } = builder.toSQL();
     const row = await this.#db.executeOne<Record<string, unknown>>(sql, params);
-    return row ? (this.#decode(row) as T) : null;
+    if (!row) return null;
+    const loaded = await this.#loadRelations([this.#decode(row)], args);
+    return (loaded[0] ?? null) as T | null;
   }
 
   async findUniqueOrThrow(args: FindUniqueArgs): Promise<T> {
@@ -385,18 +598,400 @@ export class ModelDelegate<T = Record<string, unknown>> {
     return result;
   }
 
+  /**
+   * Groups the rows and aggregates over each group.
+   *
+   * The group columns are selected next to the aggregates, so the result of
+   * a group is one row.
+   */
+  async groupBy(args: GroupByArgs): Promise<GroupByResult[]> {
+    const dialect = this.#db.dialect;
+    const quote = dialect.quote;
+    const table = quote(this.#model.table.name);
+
+    const by = Array.isArray(args.by) ? args.by : [args.by];
+    if (by.length === 0) {
+      throw new OrmError(`Cannot group ${this.#model.name} by an empty list of columns`);
+    }
+    for (const column of by) {
+      if (!this.#model.table.columns.some((candidate) => candidate.name === column)) {
+        throw new OrmError(
+          `Cannot group ${this.#model.name} by "${column}", which the table does not have`,
+        );
+      }
+    }
+
+    const selectColumns = by.map((column) => quote(column));
+    selectColumns.push(`COUNT(*) as ${quote('_count')}`);
+
+    const aggregates: { fn: 'SUM' | 'AVG' | 'MIN' | 'MAX'; columns: Record<string, true> }[] = [];
+    if (args._sum) aggregates.push({ fn: 'SUM', columns: args._sum });
+    if (args._avg) aggregates.push({ fn: 'AVG', columns: args._avg });
+    if (args._min) aggregates.push({ fn: 'MIN', columns: args._min });
+    if (args._max) aggregates.push({ fn: 'MAX', columns: args._max });
+
+    for (const aggregate of aggregates) {
+      for (const column of Object.keys(aggregate.columns)) {
+        selectColumns.push(
+          `${aggregate.fn}(${quote(column)}) as ${quote(`_${aggregate.fn.toLowerCase()}_${column}`)}`,
+        );
+      }
+    }
+
+    const where = compileWhere(args.where, dialect);
+    const whereSql = where ? ` WHERE ${where.toFragment().sql}` : '';
+    const whereParams = where ? where.toFragment().params : [];
+
+    const groupSql = ` GROUP BY ${by.map((column) => quote(column)).join(', ')}`;
+    const orderBy = normalizeOrderBy(args.orderBy);
+    const orderSql = orderBy.length
+      ? ` ORDER BY ${orderBy
+          .map((entry) => `${quote(entry.column)} ${entry.direction.toUpperCase()}`)
+          .join(', ')}`
+      : '';
+
+    const sql =
+      `SELECT ${selectColumns.join(', ')} FROM ${table}${whereSql}${groupSql}${orderSql}`;
+    const rows = await this.#db.executeAll<Record<string, unknown>>(sql, whereParams);
+
+    return rows.map((row) => {
+      const group: Record<string, unknown> = {};
+      for (const column of by) group[column] = row[column];
+
+      const result: GroupByResult = {
+        group,
+        _count: Number(row._count ?? 0),
+        _sum: {},
+        _avg: {},
+        _min: {},
+        _max: {},
+      };
+
+      for (const aggregate of aggregates) {
+        const bucket = result[`_${aggregate.fn.toLowerCase()}` as '_sum' | '_avg' | '_min' | '_max'];
+        for (const column of Object.keys(aggregate.columns)) {
+          const value = row[`_${aggregate.fn.toLowerCase()}_${column}`];
+          bucket[column] = value === null || value === undefined ? null : Number(value);
+        }
+      }
+
+      return result;
+    });
+  }
+
   /* --------------------------------- write --------------------------------- */
 
   async create(args: CreateArgs): Promise<T> {
+    const nested = this.#splitNested(args.data);
+    if (nested.relations.length > 0) {
+      return (await this.#createWithRelations(nested.relations, nested.data)) as T;
+    }
+    return this.#createRow(args.data, args.select);
+  }
+
+  /**
+   * Splits the data of a write into the columns of the table and the
+   * relations that have to be written with them.
+   */
+  #splitNested(data: Record<string, unknown>): {
+    data: Record<string, unknown>;
+    relations: { name: string; write: NestedWrite }[];
+  } {
+    const columns: Record<string, unknown> = {};
+    const relations: { name: string; write: NestedWrite }[] = [];
+
+    for (const [key, value] of Object.entries(data)) {
+      const relation = this.#relationFor(key);
+      if (!relation) {
+        columns[key] = value;
+        continue;
+      }
+      if (!value || typeof value !== 'object') continue;
+      relations.push({ name: key, write: value as NestedWrite });
+    }
+
+    return { data: columns, relations };
+  }
+
+  /** The relation of the model with that name. */
+  #relationFor(name: string): ResolvedRelation | undefined {
+    return this.#db.relationsOf(this.#model).find(
+      (relation) => relation.definition.name === name,
+    );
+  }
+
+  /**
+   * Creates the parent row and writes its relations in the same transaction.
+   *
+   * The parent is written first, because the relation needs its key.
+   */
+  async #createWithRelations(
+    relations: { name: string; write: NestedWrite }[],
+    data: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return this.#db.transaction(async (tx) => {
+      const delegate = tx.delegateOf(this.#model.name) as ModelDelegate<any>;
+      const parent = (await delegate.create({ data })) as Record<string, unknown>;
+
+      for (const { name, write } of relations) {
+        await this.#writeRelation(tx, delegate, parent, name, write);
+      }
+
+      // The parent row is read back with its relations, so the caller gets
+      // the same shape a read with `include` returns.
+      const identity = delegate.primaryKeyColumn;
+      if (!identity) return parent;
+      const reloaded = (await delegate.findUnique({
+        where: { [identity]: parent[identity] } as WhereInput,
+        include: Object.fromEntries(relations.map(({ name }) => [name, true])),
+      })) as Record<string, unknown> | null;
+      return reloaded ?? parent;
+    });
+  }
+
+  /**
+   * Writes one relation of a parent row.
+   *
+   * `create` inserts the related rows and links them, `connect` links the
+   * rows that already exist and `disconnect` unlinks them.
+   */
+  async #writeRelation(
+    tx: Database,
+    parentDelegate: ModelDelegate<any>,
+    parent: Record<string, unknown>,
+    name: string,
+    write: NestedWrite,
+  ): Promise<void> {
+    const relation = this.#relationFor(name);
+    if (!relation) {
+      throw new OrmError(`The model ${this.#model.name} has no relation named "${name}"`);
+    }
+
+    const related = tx.modelByTable(relation.relatedTable);
+    if (!related) {
+      throw new OrmError(
+        `The relation "${name}" points at the table "${relation.relatedTable}", which has no model`,
+      );
+    }
+    const relatedDelegate = tx.delegateOf(related.name) as ModelDelegate<any>;
+
+    // The key of the parent row.
+    //
+    // When the foreign key is on the parent, the key is the primary key of
+    // the parent: the foreign key is what the write sets, and it is still
+    // empty at this point. When the foreign key is on the related row, the
+    // key is the column the foreign key points at.
+    const parentIdentity = parentDelegate.primaryKeyColumn;
+    const parentKey = relation.foreignKeyOnParent
+      ? parentIdentity
+        ? parent[parentIdentity]
+        : undefined
+      : parent[relation.parentKeyColumn];
+    if (parentKey === undefined || parentKey === null) {
+      throw new OrmError(
+        `The relation "${name}" needs the key of ${this.#model.name}, but the written row does not have it`,
+      );
+    }
+
+    // The key of a related row, taken from the data of a connect or a
+    // disconnect.
+    const relatedKeyOf = (data: Record<string, unknown>): unknown => {
+      const primary = related.table.columns.find((column) => column.primaryKey);
+      if (primary && data[primary.name] !== undefined) return data[primary.name];
+      if (data[relation.relatedMatchColumn] !== undefined) {
+        return data[relation.relatedMatchColumn];
+      }
+      return undefined;
+    };
+
+    for (const data of write.create ?? []) {
+      const payload = { ...data };
+      if (relation.foreignKeyOnParent) {
+        // The foreign key is on the parent, so the related row is written
+        // first and the parent is linked to it afterwards.
+        const created = (await relatedDelegate.create({ data: payload })) as Record<string, unknown>;
+        await this.#linkRows(tx, relation, parentKey, created[relation.relatedMatchColumn]);
+        continue;
+      }
+
+      // The foreign key is on the related row, so it points at the parent.
+      payload[relation.relatedMatchColumn] = parentKey;
+      const created = (await relatedDelegate.create({ data: payload })) as Record<string, unknown>;
+      if (relation.through) {
+        await this.#linkRows(tx, relation, parentKey, created[relation.relatedMatchColumn]);
+      }
+    }
+
+    for (const data of write.connect ?? []) {
+      const key = relatedKeyOf(data);
+      if (key === undefined) {
+        throw new OrmError(
+          `Cannot connect the relation "${name}": the data does not name the key of "${relation.relatedTable}"`,
+        );
+      }
+      // The related row is looked up by its own key, not by the foreign
+      // key, because the foreign key is what the write sets.
+      const relatedPrimary = related.table.columns.find((column) => column.primaryKey);
+      const lookupColumn = relatedPrimary?.name ?? relation.relatedMatchColumn;
+      const found = (await relatedDelegate.findUnique({
+        where: { [lookupColumn]: key } as WhereInput,
+      })) as Record<string, unknown> | null;
+      if (!found) {
+        throw new OrmError(
+          `Cannot connect the relation "${name}": no row of "${relation.relatedTable}" has the key ${JSON.stringify(key)}`,
+        );
+      }
+      await this.#linkRows(tx, relation, parentKey, key);
+    }
+
+    for (const data of write.disconnect ?? []) {
+      const key = relatedKeyOf(data);
+      if (key === undefined) {
+        throw new OrmError(
+          `Cannot disconnect the relation "${name}": the data does not name the key of "${relation.relatedTable}"`,
+        );
+      }
+      await this.#unlinkRows(tx, relation, parentKey, key);
+    }
+
+    void parentDelegate;
+  }
+
+  /**
+   * Links a parent row and a related row.
+   *
+   * The foreign key decides where the link lives:
+   *
+   * - the foreign key is on the parent: the parent column is written with
+   *   the key of the related row;
+   * - the foreign key is on the related row: the related row is written with
+   *   the key of the parent;
+   * - a many-to-many relation: a row is written to the join table.
+   */
+  async #linkRows(
+    tx: Database,
+    relation: ResolvedRelation,
+    parentKey: unknown,
+    relatedKey: unknown,
+  ): Promise<void> {
+    if (relation.through) {
+      const columns = [relation.through.fromColumn, relation.through.toColumn];
+      await tx.executeRun(
+        `INSERT INTO ${this.#db.dialect.quote(relation.through.table)} (${columns
+          .map((column) => this.#db.dialect.quote(column))
+          .join(', ')}) VALUES (?, ?)`,
+        [parentKey as never, relatedKey as never],
+      );
+      return;
+    }
+
+    if (relation.foreignKeyOnParent) {
+      // The parent column is written with the key of the related row.
+      const parent = tx.delegateOf(this.#model.name) as ModelDelegate<any> | undefined;
+      if (!parent) return;
+      await parent.update({
+        where: this.#primaryKeyWhere(parent, parentKey),
+        data: { [relation.parentKeyColumn]: relatedKey },
+      });
+      return;
+    }
+
+    // The related row is written with the key of the parent.
+    const related = tx.modelByTable(relation.relatedTable);
+    const delegate = tx.delegateOf(related?.name ?? '') as ModelDelegate<any> | undefined;
+    if (!delegate) return;
+    const primary = related?.table.columns.find((column) => column.primaryKey);
+    if (!primary) {
+      throw new OrmError(
+        `The table "${relation.relatedTable}" has no primary key, so the relation cannot be written`,
+      );
+    }
+    await delegate.update({
+      where: { [primary.name]: relatedKey } as WhereInput,
+      data: { [relation.relatedMatchColumn]: parentKey },
+    });
+  }
+
+  /** The where clause that finds a row by its primary key. */
+  #primaryKeyWhere(delegate: ModelDelegate<any>, key: unknown): WhereInput {
+    const primary = delegate.primaryKeyColumn;
+    if (!primary) {
+      throw new OrmError(
+        `The table "${delegate.tableName}" has no primary key, so the relation cannot be written`,
+      );
+    }
+    return { [primary]: key } as WhereInput;
+  }
+
+  /** Unlinks a parent row and a related row. */
+  async #unlinkRows(
+    tx: Database,
+    relation: ResolvedRelation,
+    parentKey: unknown,
+    relatedKey: unknown,
+  ): Promise<void> {
+    if (relation.through) {
+      await tx.executeRun(
+        `DELETE FROM ${this.#db.dialect.quote(relation.through.table)}` +
+          ` WHERE ${this.#db.dialect.quote(relation.through.fromColumn)} = ?` +
+          ` AND ${this.#db.dialect.quote(relation.through.toColumn)} = ?`,
+        [parentKey as never, relatedKey as never],
+      );
+      return;
+    }
+
+    if (relation.foreignKeyOnParent) {
+      const parent = tx.delegateOf(this.#model.name) as ModelDelegate<any> | undefined;
+      if (!parent) return;
+      await parent.update({
+        where: this.#primaryKeyWhere(parent, parentKey),
+        data: { [relation.parentKeyColumn]: null },
+      });
+      return;
+    }
+
+    // The foreign key is on the related row, so it is cleared. The row
+    // itself stays.
+    const related = tx.modelByTable(relation.relatedTable);
+    const delegate = tx.delegateOf(related?.name ?? '') as ModelDelegate<any> | undefined;
+    if (!delegate) return;
+    const primary = related?.table.columns.find((column) => column.primaryKey);
+    if (!primary) {
+      throw new OrmError(
+        `The table "${relation.relatedTable}" has no primary key, so the relation cannot be written`,
+      );
+    }
+    const foreignKey = related?.table.columns.find(
+      (column) => column.name === relation.relatedMatchColumn,
+    );
+    if (foreignKey?.notNull) {
+      throw new OrmError(
+        `Cannot disconnect the relation "${relation.definition.name}": the column "${relation.relatedMatchColumn}" of "${relation.relatedTable}" is not nullable, so the link cannot be cleared. Make the column nullable or delete the row instead`,
+      );
+    }
+    await delegate.update({
+      where: { [primary.name]: relatedKey } as WhereInput,
+      data: { [relation.relatedMatchColumn]: null },
+    });
+  }
+
+  /**
+   * Creates one row and reads it back.
+   */
+  async #createRow(
+    rawData: Record<string, unknown>,
+    select?: string[] | SelectShape,
+  ): Promise<T> {
     const dialect = this.#db.dialect;
     const table = this.#model.table.name;
-    const data = this.#encode(args.data);
+    const data = this.#encode(rawData);
+    const columns = Array.isArray(select) ? select : undefined;
 
     if (dialect.supportsReturning) {
       const builder = new InsertBuilder(
         table,
         [data],
-        args.select ?? ['*'],
+        columns ?? ['*'],
         undefined,
         dialect.quote,
       );
@@ -413,7 +1008,7 @@ export class ModelDelegate<T = Record<string, unknown>> {
       if (primaryKey) {
         const found = await this.findUnique({
           where: { [primaryKey.name]: primaryKey.value } as WhereInput,
-          select: args.select,
+          select: columns,
         });
         if (found) return found;
       }
@@ -424,7 +1019,7 @@ export class ModelDelegate<T = Record<string, unknown>> {
       if (unique) {
         const found = await this.findUnique({
           where: { [unique.name]: unique.value } as WhereInput,
-          select: args.select,
+          select: columns,
         });
         if (found) return found;
       }
@@ -440,7 +1035,7 @@ export class ModelDelegate<T = Record<string, unknown>> {
     if (primaryKey) {
       const found = await this.findUnique({
         where: { [primaryKey.name]: primaryKey.value } as WhereInput,
-        select: args.select,
+        select: columns,
       });
       if (found) return found;
     }
@@ -463,9 +1058,56 @@ export class ModelDelegate<T = Record<string, unknown>> {
   }
 
   async update(args: UpdateArgs): Promise<T> {
+    const nested = this.#splitNested(args.data);
+    if (nested.relations.length > 0) {
+      return (await this.#updateWithRelations(args, nested)) as T;
+    }
+    return this.#updateRow(args, args.data, args.select);
+  }
+
+  /**
+   * Updates the parent row and writes its relations in the same
+   * transaction.
+   */
+  async #updateWithRelations(
+    args: UpdateArgs,
+    nested: { data: Record<string, unknown>; relations: { name: string; write: NestedWrite }[] },
+  ): Promise<Record<string, unknown>> {
+    return this.#db.transaction(async (tx) => {
+      const delegate = tx.delegateOf(this.#model.name) as ModelDelegate<any>;
+
+      // A write that only touches a relation has no column to write on the
+      // parent, so the parent row is only read.
+      const parent = (
+        Object.keys(nested.data).length > 0
+          ? await delegate.update({
+              where: args.where,
+              data: nested.data,
+              select: args.select,
+            })
+          : await delegate.findFirstOrThrow({ where: args.where })
+      ) as Record<string, unknown>;
+
+      for (const { name, write } of nested.relations) {
+        await this.#writeRelation(tx, delegate, parent, name, write);
+      }
+
+      return parent;
+    });
+  }
+
+  /**
+   * Updates one row and reads it back.
+   */
+  async #updateRow(
+    args: UpdateArgs,
+    rawData: Record<string, unknown>,
+    select?: string[] | SelectShape,
+  ): Promise<T> {
     const dialect = this.#db.dialect;
     const table = this.#model.table.name;
-    const data = this.#encode(args.data);
+    const data = this.#encode(rawData);
+    const columns = Array.isArray(select) ? select : undefined;
 
     if (dialect.supportsReturningOnUpdate) {
       const builder = new UpdateBuilder(
@@ -1000,6 +1642,7 @@ export class Database {
   readonly #dialect: Dialect;
   readonly #delegates = new Map<string, ModelDelegate<any>>();
   readonly #models: ModelDefinition[] = [];
+  readonly #relations: RelationDefinition[] = [];
 
   constructor(driver: Driver) {
     this.#driver = driver;
@@ -1038,9 +1681,48 @@ export class Database {
 
   model(definition: ModelDefinition): ModelDelegate<any> {
     this.#models.push(definition);
+    for (const relation of definition.relations ?? []) {
+      this.#relations.push(relation);
+    }
     const delegate = new ModelDelegate(this, definition);
     this.#delegates.set(definition.name, delegate);
     return delegate;
+  }
+
+  /**
+   * The relations of a model, resolved for its table.
+   *
+   * A relation declared on the model is used as it is. A relation declared on
+   * the other side of the same pair is used for the reverse direction, so a
+   * relation declared on the child table can be loaded on the parent table
+   * as well.
+   */
+  relationsOf(model: ModelDefinition): ResolvedRelation[] {
+    const table = model.table.name;
+    const resolved: ResolvedRelation[] = [];
+
+    for (const definition of model.relations ?? []) {
+      const relation = resolveRelation(definition, table);
+      if (relation) resolved.push(relation);
+    }
+
+    for (const definition of this.#relations) {
+      if (resolved.some((candidate) => candidate.definition.name === definition.name)) continue;
+      const relation = resolveRelation(definition, table);
+      if (relation) resolved.push(relation);
+    }
+
+    return resolved;
+  }
+
+  /** The models of the database, keyed by their table name. */
+  modelByTable(table: string): ModelDefinition | undefined {
+    return this.#models.find((model) => model.table.name === table);
+  }
+
+  /** The delegate of a model, by its name. */
+  delegateOf(name: string): ModelDelegate<any> | undefined {
+    return this.#delegates.get(name);
   }
 
   get models(): ModelDefinition[] {

@@ -2,7 +2,13 @@
  * ORM entry point.
  */
 
-export { Database, ModelDelegate, NotFoundError, OrmError, UniqueConstraintError } from './client.ts';
+export {
+  Database,
+  ModelDelegate,
+  NotFoundError,
+  OrmError,
+  UniqueConstraintError,
+} from './client.ts';
 export type {
   AggregateArgs,
   AggregateResult,
@@ -14,13 +20,29 @@ export type {
   FindFirstArgs,
   FindManyArgs,
   FindUniqueArgs,
+  GroupByArgs,
+  GroupByResult,
+  IncludeShape,
   ModelDefinition,
+  NestedData,
+  NestedWrite,
+  RelationInclude,
+  SelectShape,
   UpdateArgs,
   UpdateManyArgs,
   UpsertArgs,
   WhereInput,
   WhereValue,
 } from './client.ts';
+
+export {
+  PARENT_KEY_ALIAS,
+  assertRelationMatchesSchema,
+  buildRelationQuery,
+  resolveRelation,
+  whereCondition,
+} from './relations.ts';
+export type { RelationQueryPlan, ResolvedRelation } from './relations.ts';
 
 export {
   createDriver,

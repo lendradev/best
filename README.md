@@ -6,7 +6,23 @@ runtime dependencies**.
 [![Bun](https://img.shields.io/badge/Bun-%3E%3D%201.4.0-black)](https://bun.sh)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> **Status: v0.4.0 — early. The API is not frozen.**
+> **Status: v0.5.0 — early. The API is not frozen.**
+
+## Changes in v0.5.0
+
+The ORM can load relations, group rows and write a relation together with its
+parent.
+
+- **Relations.** A relation is declared with `relation()` and loaded with
+  `include`. The load uses a second query instead of a join, so `take` and
+  `skip` count the parent rows, and it costs one query per relation rather
+  than one per row. The same declaration serves both sides of a relation.
+- **Nested selection.** `select` accepts a shape, so the columns of the
+  parent and of a relation are picked separately.
+- **Grouping.** `groupBy` returns one row per group with the aggregates.
+- **Nested writes.** `create` and `update` carry a relation with `create`,
+  `connect` and `disconnect`. The write runs in one transaction, so a failing
+  relation write rolls the parent write back.
 
 ## Changes in v0.4.0
 
@@ -77,7 +93,7 @@ Breaking changes, all in the ORM:
 | Area | What is included |
 |---|---|
 | HTTP | Modules, dependency injection, controllers, routing, middleware, guards, interceptors, exception filters, lifecycle hooks, request validation |
-| ORM | Schema helpers, a model delegate with `find` / `create` / `update` / `upsert` / `delete` / `aggregate`, SQL builders, migrations |
+| ORM | Schema helpers, a model delegate with `find` / `create` / `update` / `upsert` / `delete` / `aggregate` / `groupBy`, relation loading, nested writes, SQL builders, migrations |
 | Backends | SQLite, PostgreSQL, MySQL, MariaDB behind one API and one dialect layer |
 | Cache | An in-memory cache manager with a lifetime per entry, a size limit and a single-flight loader |
 | Worker | An in-process job queue with retries, backoff and a concurrency limit |

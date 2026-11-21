@@ -52,6 +52,8 @@ export interface RelationDefinition {
   toColumn: string;
   kind: 'one-to-one' | 'one-to-many' | 'many-to-one' | 'many-to-many';
   onDelete?: OnDelete;
+  /** The join table of a many-to-many relation. */
+  through?: { table: string; fromColumn: string; toColumn: string };
 }
 
 export interface SchemaDefinition {

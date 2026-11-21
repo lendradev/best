@@ -1245,18 +1245,21 @@ placeholder count that does not match the number of bound parameters.
 
 `findUnique`, `findUniqueOrThrow`, `findFirst`, `findFirstOrThrow`,
 `findMany`, `create`, `createMany`, `update`, `updateMany`, `upsert`,
-`delete`, `deleteMany`, `count`, `aggregate`.
+`delete`, `deleteMany`, `count`, `aggregate`, `groupBy`.
 
 Arguments:
 
 ```ts
-findMany({ where, orderBy, select, take, skip })
+findMany({ where, orderBy, select, take, skip, include })
+findUnique({ where, select, include })
+findFirst({ where, orderBy, select, take, skip, include })
 create({ data, select })
 update({ where, data, select })
 upsert({ where, create, update })
 delete({ where })
 count({ where })
 aggregate({ where, _count, _sum, _avg, _min, _max })
+groupBy({ by, where, orderBy, _count, _sum, _avg, _min, _max })
 ```
 
 Where operators: `equals`, `not`, `in`, `notIn`, `gt`, `gte`, `lt`, `lte`,
@@ -1264,6 +1267,152 @@ Where operators: `equals`, `not`, `in`, `notIn`, `gt`, `gte`, `lt`, `lte`,
 
 A `boolean` column round-trips as a boolean on every backend, whatever the
 backend stores it as.
+
+### Relations
+
+A relation is declared with `relation()` and named after the relation it
+describes. The foreign key side comes first: `fromTable.fromColumn` points at
+`toTable.toColumn`.
+
+```ts
+const userPosts = relation({
+  name: 'posts',
+  fromTable: 'posts',
+  fromColumn: 'userId',
+  toTable: 'users',
+  toColumn: 'id',
+  kind: 'one-to-many',
+});
+
+db.model({ name: 'user', table: users, relations: [userPosts] });
+```
+
+The kind is `one-to-one`, `one-to-many`, `many-to-one` or `many-to-many`. A
+many-to-many relation names its join table:
+
+```ts
+relation({
+  name: 'tags',
+  fromTable: 'posts',
+  fromColumn: 'id',
+  toTable: 'tags',
+  toColumn: 'id',
+  kind: 'many-to-many',
+  through: { table: 'post_tags', fromColumn: 'postId', toColumn: 'tagId' },
+});
+```
+
+The same declaration serves both sides of a relation: it can be loaded on the
+table that holds the foreign key and on the table the foreign key points at.
+
+#### `include`
+
+`include` loads a relation on the read methods.
+
+```ts
+const posts = await db.post.findMany({ include: { author: true } });
+const users = await db.user.findMany({ include: { posts: true } });
+```
+
+The relation is loaded with a second query, not with a join: a join
+multiplies the rows, so `take` and `skip` would count the joined rows instead
+of the parent rows. The load costs one query per relation, never one per row.
+
+A relation is loaded as a whole or filtered:
+
+```ts
+await db.post.findMany({
+  include: { comments: { where: { body: { contains: 'nice' } } } },
+});
+```
+
+The columns of a relation are picked with `select`:
+
+```ts
+await db.post.findMany({
+  include: { author: { select: { name: true } } },
+});
+```
+
+A relation whose key column was not selected is reported, rather than loaded
+as an empty relation.
+
+#### `select`
+
+`select` accepts a plain column list or a shape. A relation name in the shape
+picks the columns of that relation.
+
+```ts
+await db.post.findMany({
+  select: { title: true, author: { select: { name: true } } },
+});
+```
+
+#### `groupBy`
+
+`groupBy` groups the rows and aggregates over each group.
+
+```ts
+const groups = await db.order.groupBy({
+  by: 'status',
+  _count: true,
+  _sum: { total: true },
+  where: { createdAt: { gte: since } },
+});
+```
+
+The result is one row per group:
+
+```ts
+[
+  { group: { status: 'paid' }, _count: 3, _sum: { total: 450 } },
+  { group: { status: 'open' }, _count: 1, _sum: { total: 90 } },
+]
+```
+
+`by` takes one column or a list of columns. The aggregates are the same set
+the `aggregate` method supports.
+
+#### Nested writes
+
+A write can carry a relation. The relation supports `create`, `connect` and
+`disconnect`.
+
+```ts
+const post = await db.post.create({
+  data: {
+    title: 'Hello',
+    author: { create: [{ email: 'ada@example.com', name: 'Ada' }] },
+    comments: { create: [{ body: 'Nice' }] },
+  },
+});
+
+await db.post.update({
+  where: { id: '1' },
+  data: { comments: { connect: [{ id: '2' }] } },
+});
+
+await db.post.update({
+  where: { id: '1' },
+  data: { comments: { disconnect: [{ id: '2' }] } },
+});
+```
+
+| Key | Meaning |
+|---|---|
+| `create` | Inserts the related rows and links them to the parent |
+| `connect` | Links the rows that already exist, found by their key |
+| `disconnect` | Unlinks the rows, without deleting them |
+
+The write runs in one transaction, so a failing relation write rolls the
+parent write back. The parent row is read back with its relations, so the
+result has the same shape a read with `include` returns.
+
+`disconnect` clears the foreign key, so the column has to be nullable. A
+column that is not nullable is reported.
+
+A nested write creates, connects and disconnects. It does not update the
+related rows.
 
 ### Schema
 
