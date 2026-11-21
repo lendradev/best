@@ -6,7 +6,25 @@ runtime dependencies**.
 [![Bun](https://img.shields.io/badge/Bun-%3E%3D%201.4.0-black)](https://bun.sh)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> **Status: v0.3.0 — early. The API is not frozen.**
+> **Status: v0.4.0 — early. The API is not frozen.**
+
+## Changes in v0.4.0
+
+The request pipeline is complete. The two pieces that were declared but never
+executed now run:
+
+- **Middleware.** `@UseMiddleware` runs before the guards. A middleware calls
+  `next()` to let the request continue, or returns a `Response` to answer the
+  request itself. `AppOptions.globalMiddleware` applies one to every route.
+- **Request scope.** A provider declared with `@Injectable({ scope: 'request' })`
+  gets one instance per request. Every request gets its own child container,
+  so two requests never share an instance and two providers of the same
+  request do. A controller that depends on a request-scoped provider is
+  resolved per request as well.
+
+A member without dependencies does not have to be listed in the module: it is
+instantiated directly. A member with dependencies has to be a provider of the
+module.
 
 ## Changes in v0.3.0
 
@@ -58,7 +76,7 @@ Breaking changes, all in the ORM:
 
 | Area | What is included |
 |---|---|
-| HTTP | Modules, dependency injection, controllers, routing, guards, interceptors, exception filters, lifecycle hooks, request validation |
+| HTTP | Modules, dependency injection, controllers, routing, middleware, guards, interceptors, exception filters, lifecycle hooks, request validation |
 | ORM | Schema helpers, a model delegate with `find` / `create` / `update` / `upsert` / `delete` / `aggregate`, SQL builders, migrations |
 | Backends | SQLite, PostgreSQL, MySQL, MariaDB behind one API and one dialect layer |
 | Cache | An in-memory cache manager with a lifetime per entry, a size limit and a single-flight loader |
@@ -152,6 +170,9 @@ export class UserController {
 
 Every dependency names its token with `@Inject`, because Bun's transpiler does
 not emit decorator metadata.
+
+A provider declared with `scope: 'request'` gets one instance per request, and
+a middleware declared with `@UseMiddleware` runs before the guards.
 
 Also included: guards, interceptors, exception filters, lifecycle hooks, a
 `Logger`, a `ConfigService`, an event emitter, a static file handler, a

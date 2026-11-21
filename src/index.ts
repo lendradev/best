@@ -78,6 +78,7 @@ export type {
   ExceptionFilter,
   ExecutionContext,
   NestInterceptor,
+  NestMiddleware,
   PipeTransform,
 } from './http/contracts.ts';
 

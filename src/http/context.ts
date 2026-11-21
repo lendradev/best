@@ -33,7 +33,15 @@ export interface RouteDefinition {
   interceptors: any[];
   filters: any[];
   pipes: any[];
-  handler: (...args: any[]) => unknown;
+  /** Request-level middleware that runs before the guards. */
+  middlewares?: any[];
+  /**
+   * Whether the controller depends on a request-scoped provider. Such a
+   * controller is resolved per request instead of once at build time.
+   */
+  requestScoped?: boolean;
+  /** Absent when the controller is resolved per request. */
+  handler?: (...args: any[]) => unknown;
   controllerType: any;
 }
 

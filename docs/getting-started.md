@@ -206,7 +206,76 @@ directly to the response status.
 
 ---
 
-## 8. The ORM
+## 8. Middleware
+
+Middleware runs before the guards. It is request-level work: reading a header,
+rejecting a token, measuring the request.
+
+```ts
+import { ExecutionContext, NestMiddleware, UseMiddleware } from 'best';
+
+export class AuthMiddleware implements NestMiddleware {
+  async use(context: ExecutionContext, next: () => Promise<void>): Promise<void> {
+    if (!context.headers.get('authorization')) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    await next();
+  }
+}
+
+@Controller('/reports')
+export class ReportController {
+  @Get('/')
+  @UseMiddleware(AuthMiddleware)
+  list() { /* ... */ }
+}
+```
+
+A middleware calls `next()` to let the request continue, or returns a
+`Response` to answer the request itself — the handler does not run then.
+
+A middleware without dependencies does not have to be listed in the module. One
+with dependencies has to be a provider of the module.
+
+A middleware can also be applied to every route:
+
+```ts
+const app = await createContext([AppModule], {
+  globalMiddleware: [RequestLogger],
+});
+```
+
+---
+
+## 9. Request scope
+
+A provider declared with `scope: 'request'` gets one instance per request.
+
+```ts
+import { Inject, Injectable } from 'best';
+
+@Injectable({ scope: 'request' })
+export class RequestContext {
+  readonly startedAt = Date.now();
+}
+
+@Injectable({ scope: 'request' })
+export class UserService {
+  constructor(@Inject(RequestContext) readonly context: RequestContext) {}
+}
+```
+
+Two requests never share an instance, and two providers of the same request
+do. A controller that depends on a request-scoped provider is resolved per
+request as well.
+
+A request-scoped provider cannot be injected into a singleton — that raises an
+`InjectionScopeError`. A request-scoped provider with an `onModuleDestroy`
+hook has it called when the request ends.
+
+---
+
+## 10. The ORM
 
 ```ts
 import {
@@ -275,7 +344,7 @@ const db = new Database(
 
 ---
 
-## 9. Migrations from the CLI
+## 11. Migrations from the CLI
 
 The scaffolded project has a `migrate` script that applies `src/schema.ts` to
 `app.db`:
@@ -314,7 +383,7 @@ Applied 1 statement to app.db (sqlite)
 
 ---
 
-## 10. Caching
+## 12. Caching
 
 The cache manager keeps values in memory with a lifetime and a size limit.
 
@@ -345,7 +414,7 @@ keeps at most `maxSize` entries, dropping the oldest one when it is full.
 
 ---
 
-## 11. Background jobs
+## 13. Background jobs
 
 The worker runs jobs outside the request. It is in process, so a job that has
 not finished is lost when the process exits, and a retried job may run more
@@ -386,7 +455,7 @@ watches `context.signal` can stop early.
 
 ---
 
-## 12. Static files
+## 14. Static files
 
 The static handler serves a directory over HTTP. It answers with `null` when
 the request does not match a file, so it can sit in front of the router.
@@ -414,7 +483,7 @@ same module with a custom configuration.
 
 ---
 
-## 13. WebSockets
+## 15. WebSockets
 
 The gateway routes messages between clients and the application. It never
 starts a server, so `Bun.serve` stays with you.
@@ -443,7 +512,7 @@ topic. A message that is not JSON goes to every connected client.
 
 ---
 
-## 14. Events
+## 16. Events
 
 The event emitter connects parts of an application without them knowing about
 each other.
@@ -474,7 +543,7 @@ class AppModule {}
 
 ---
 
-## 15. Rate limiting
+## 17. Rate limiting
 
 The limiter counts the requests of a client in a fixed window. The guard
 throws `TooManyRequestsException` once the window is full.
@@ -504,7 +573,7 @@ class AppModule {}
 
 ---
 
-## 16. Scheduled jobs
+## 18. Scheduled jobs
 
 The scheduler runs a task on a cron expression. The expression has five
 fields: minute, hour, day of month, month, day of week.
@@ -534,7 +603,7 @@ class AppModule {}
 
 ---
 
-## 17. Health check
+## 19. Health check
 
 Each indicator reports on one dependency. The handler answers `200` when
 everything is up and `503` when one is down.
@@ -554,7 +623,7 @@ const handler = createHealthHandler(health);
 
 ---
 
-## 18. Serialization
+## 20. Serialization
 
 The serialization interceptor maps the value a handler returned into the
 response body. Without a transform it changes nothing.
@@ -581,7 +650,7 @@ export class UserController {
 
 ---
 
-## 19. Passwords and tokens
+## 21. Passwords and tokens
 
 `hashPassword` uses argon2 through `Bun.password`. `signToken` signs a
 payload with HMAC-SHA-256; the secret is required.
@@ -611,7 +680,7 @@ class AppModule {}
 
 ---
 
-## 20. OpenAPI
+## 22. OpenAPI
 
 The document is generated from the route table, so it describes the routes the
 application actually serves.
@@ -644,7 +713,7 @@ createOpenApiDocument({
 
 ---
 
-## 21. Testing
+## 23. Testing
 
 ```ts
 import { describe, expect, test } from 'bun:test';
@@ -659,7 +728,7 @@ The framework's own suite runs with `bun test`.
 
 ---
 
-## 22. Commands
+## 24. Commands
 
 | Command | Description |
 |---|---|

@@ -155,20 +155,96 @@ export class Container {
     if (!definition) throw new UnknownProviderError(token);
 
     if (definition.scope === 'singleton') {
-      if (this.#singletons.has(token)) return this.#singletons.get(token) as T;
+      // The instance is cached on the owning container, so a child container
+      // resolves the same instance as its parent.
+      const owner = this.#ownerOf(definition.token);
+      if (owner.#singletons.has(token)) return owner.#singletons.get(token) as T;
       const instance = this.#instantiate(definition, 'singleton');
-      // Cache on the owning container so the instance is shared.
-      this.#ownerOf(definition.token).#singletons.set(definition.token, instance);
+      owner.#singletons.set(definition.token, instance);
       return instance as T;
     }
 
     if (definition.scope === 'transient') return this.#instantiate(definition, 'transient') as T;
 
-    // request scope: cached in this (child) container only
-    if (this.#singletons.has(token)) return this.#singletons.get(token) as T;
-    const instance = this.#instantiate(definition, 'request');
-    this.#singletons.set(token, instance);
-    return instance as T;
+    // request scope: cached in the child container that resolved it, so two
+    // requests never share an instance. The root container has no request
+    // context, so it does not cache at all.
+    if (this.#parent) {
+      if (this.#singletons.has(token)) return this.#singletons.get(token) as T;
+      const instance = this.#instantiate(definition, 'request');
+      this.#singletons.set(token, instance);
+      return instance as T;
+    }
+    return this.#instantiate(definition, 'request') as T;
+  }
+
+  /**
+   * Whether the token depends, directly or through another provider, on a
+   * request-scoped provider.
+   *
+   * The application uses this to decide whether a controller has to be
+   * resolved per request.
+   */
+  requiresRequestScope(token: InjectionToken, seen: Set<InjectionToken> = new Set()): boolean {
+    if (seen.has(token)) return false;
+    seen.add(token);
+
+    const definition = this.getDefinition(token);
+    if (definition) {
+      if (definition.scope === 'request') return true;
+      for (const dependency of this.#dependenciesOf(definition)) {
+        if (this.requiresRequestScope(dependency, seen)) return true;
+      }
+      return false;
+    }
+
+    // A class that is not registered yet: check its own dependencies.
+    if (typeof token === 'function') {
+      for (const dependency of this.#classDependencies(token)) {
+        if (this.requiresRequestScope(dependency, seen)) return true;
+      }
+    }
+    return false;
+  }
+
+  #classDependencies(cls: any): InjectionToken[] {
+    const dependencies: InjectionToken[] = [];
+    for (const token of getParamTokens(cls).values()) dependencies.push(token);
+    for (const token of getPropertyTokens(cls).values()) dependencies.push(token);
+    return dependencies;
+  }
+
+  /** The tokens a class injects, through the constructor or a property. */
+  classDependencies(cls: any): InjectionToken[] {
+    return this.#classDependencies(cls);
+  }
+
+  /** Whether a class declares any dependency. */
+  hasDependencies(cls: any): boolean {
+    return this.#classDependencies(cls).length > 0;
+  }
+
+  #dependenciesOf(definition: ProviderDefinition): InjectionToken[] {
+    const dependencies: InjectionToken[] = [];
+
+    if (definition.useFactory) dependencies.push(...(definition.inject ?? []));
+    if (definition.useClass) dependencies.push(...this.#classDependencies(definition.useClass));
+
+    return dependencies;
+  }
+
+  /**
+   * Releases the request-scoped instances of this container.
+   *
+   * A provider that implements `onModuleDestroy` is notified, so it can
+   * close what it opened.
+   */
+  async dispose(): Promise<void> {
+    for (const instance of this.#singletons.values()) {
+      const hook = (instance as { onModuleDestroy?: () => unknown } | null)?.onModuleDestroy;
+      if (typeof hook === 'function') await hook.call(instance);
+    }
+    this.#singletons.clear();
   }
 
   #ownerOf(token: InjectionToken): Container {

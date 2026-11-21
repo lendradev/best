@@ -13,6 +13,11 @@ export interface ExecutionContext {
   request: unknown;
   /** Populated by pipes and handlers. */
   state: Record<string, unknown>;
+  /**
+   * The container of the current request. A request-scoped provider is
+   * resolved from it, so two requests never share an instance.
+   */
+  container?: unknown;
 }
 
 export interface CanActivate {
@@ -29,6 +34,20 @@ export interface PipeTransform<T = unknown> {
 
 export interface ExceptionFilter {
   catch(exception: unknown, context: ExecutionContext): unknown;
+}
+
+/**
+ * Request-level work that runs before the guards.
+ *
+ * A middleware calls `next()` to let the request continue, or returns a
+ * `Response` to answer it itself. A middleware that does neither stops the
+ * request without a response, which the framework reports as a server error.
+ */
+export interface NestMiddleware {
+  use(
+    context: ExecutionContext,
+    next: () => Promise<void>,
+  ): void | Response | Promise<void | Response>;
 }
 
 /* -------------------------------------------------------------------------- */

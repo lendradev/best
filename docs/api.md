@@ -44,6 +44,7 @@ queue workers, cron jobs, and headless tasks.
 | `globalGuards` | `any[]` | `[]` | Guards applied to every route |
 | `globalInterceptors` | `any[]` | `[]` | Interceptors applied to every route |
 | `globalFilters` | `any[]` | `[]` | Filters applied to every route |
+| `globalMiddleware` | `any[]` | `[]` | Middleware applied to every route, before the guards |
 
 ### `Application`
 
@@ -93,6 +94,8 @@ Injects a provider into a class property after construction.
 | `registerFactory(token, fn, inject, { scope? })` | Register a factory |
 | `resolve(token)` | Resolve a provider, honouring scope |
 | `createChild()` | Create an isolated child container (request scope) |
+| `requiresRequestScope(token)` | Whether the token depends on a request-scoped provider |
+| `dispose()` | Release the request-scoped instances of the container |
 | `has(token)`, `getDefinition(token)`, `tokens()` | Introspection |
 
 Errors: `UnknownProviderError`, `CircularDependencyError`, `InjectionScopeError`.
@@ -170,6 +173,23 @@ interface PipeTransform<T = unknown> {
 }
 ```
 
+### `NestMiddleware`
+
+```ts
+interface NestMiddleware {
+  use(
+    context: ExecutionContext,
+    next: () => Promise<void>,
+  ): void | Response | Promise<void | Response>;
+}
+```
+
+Middleware runs before the guards. A middleware calls `next()` to let the
+request continue, or returns a `Response` to answer the request itself — the
+handler and the middleware after it do not run. A middleware that neither
+calls `next()` nor returns a `Response` stops the request, which the
+framework reports as a `500`.
+
 ### `ExceptionFilter`
 
 ```ts
@@ -189,14 +209,75 @@ up the chain.
 | `params` | Path parameters |
 | `query` | `URLSearchParams` |
 | `headers` | Request headers |
-| `body` | Parsed body |
+| `body` | Parsed body; a middleware may replace it |
 | `request` | The raw `Request` |
 | `state` | Mutable bag shared across the request |
+| `container` | The container of the request; request-scoped providers are resolved from it |
 
 ### Applying them
 
 `@UseGuards(...)`, `@UseInterceptors(...)`, `@UseFilters(...)`,
-`@UsePipes(...)` — usable on a class or a method.
+`@UsePipes(...)`, `@UseMiddleware(...)` — usable on a class or a method.
+
+A member declared on a class applies to every route of that class; a member
+declared on a method applies to that route only. `AppOptions.globalGuards`,
+`globalInterceptors`, `globalFilters`, `globalPipes` and `globalMiddleware`
+apply to every route.
+
+A member that declares no dependency does not have to be listed in the
+module: it is instantiated directly. A member with dependencies has to be a
+provider of the module.
+
+### Middleware
+
+```ts
+import { Controller, Get, UseMiddleware, type NestMiddleware } from 'best';
+
+class AuthMiddleware implements NestMiddleware {
+  async use(context: ExecutionContext, next: () => Promise<void>): Promise<void> {
+    if (!context.headers.get('authorization')) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    await next();
+  }
+}
+
+@Controller('/reports')
+class ReportController {
+  @Get('/')
+  @UseMiddleware(AuthMiddleware)
+  list() {
+    return [];
+  }
+}
+```
+
+### Request scope
+
+A provider declared with `@Injectable({ scope: 'request' })` gets one instance
+per request. Two requests never share an instance, and two providers of the
+same request do.
+
+```ts
+import { Inject, Injectable } from 'best';
+
+@Injectable({ scope: 'request' })
+class RequestContext {
+  readonly startedAt = Date.now();
+}
+
+@Injectable({ scope: 'request' })
+class UserService {
+  constructor(@Inject(RequestContext) readonly context: RequestContext) {}
+}
+```
+
+A controller that depends on a request-scoped provider is resolved per
+request as well. A request-scoped provider cannot be injected into a
+singleton — that raises an `InjectionScopeError`.
+
+A request-scoped provider with an `onModuleDestroy` hook has it called when
+the request ends.
 
 ---
 

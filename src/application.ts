@@ -10,9 +10,11 @@ import type { InjectionToken } from './core/tokens.ts';
 import {
   getClassDecorators,
   getMethodDecorators,
+  HttpException,
   type ExceptionFilter,
   type ExecutionContext,
   type NestInterceptor,
+  type NestMiddleware,
   type PipeTransform,
 } from './http/contracts.ts';
 import { getParamMeta } from './http/param-decorators.ts';
@@ -40,6 +42,8 @@ export interface AppOptions {
   globalInterceptors?: any[];
   /** Extra filters applied to every route. */
   globalFilters?: any[];
+  /** Extra middleware applied to every route, before the guards. */
+  globalMiddleware?: any[];
 }
 
 export type ResolvedAppOptions = Required<AppOptions>;
@@ -62,6 +66,7 @@ export class Application {
       globalGuards: options.globalGuards ?? [],
       globalInterceptors: options.globalInterceptors ?? [],
       globalFilters: options.globalFilters ?? [],
+      globalMiddleware: options.globalMiddleware ?? [],
     };
     this.#modules = modules;
   }
@@ -110,7 +115,12 @@ export class Application {
 
     for (const controller of metadata.controllers) {
       this.#controllers.push(controller);
-      this.container.registerClass(controller);
+      // A controller that depends on a request-scoped provider is scoped to
+      // the request, so it is resolved from the container of that request.
+      const scope: ProviderScope = this.container.requiresRequestScope(controller)
+        ? 'request'
+        : 'singleton';
+      this.container.registerClass(controller, { scope });
     }
   }
 
@@ -168,9 +178,15 @@ export class Application {
       const codes = getHttpCodes(controllerType);
 
       for (const route of routes) {
-        const instance = this.container.resolve(controllerType) as Record<string, unknown>;
-        const handler = instance[route.handlerName];
-        if (typeof handler !== 'function') continue;
+        const requestScoped = this.container.requiresRequestScope(controllerType);
+        let handler: ((...args: any[]) => unknown) | undefined;
+
+        if (!requestScoped) {
+          const instance = this.container.resolve(controllerType) as Record<string, unknown>;
+          const bound = instance[route.handlerName];
+          if (typeof bound !== 'function') continue;
+          handler = bound.bind(instance) as (...args: any[]) => unknown;
+        }
 
         const fullPath = this.#joinPaths(this.options.globalPrefix, prefix, route.path);
         const defaultStatus = codes.get(route.handlerName) ?? (route.method === 'POST' ? 201 : 200);
@@ -179,7 +195,8 @@ export class Application {
           method: route.method,
           path: fullPath,
           handlerName: route.handlerName,
-          handler: handler.bind(instance) as (...args: any[]) => unknown,
+          handler,
+          requestScoped,
           guards: [
             ...this.options.globalGuards,
             ...(getClassDecorators(controllerType, Symbol.for('best:guards')) ?? []),
@@ -200,6 +217,11 @@ export class Application {
             ...(getClassDecorators(controllerType, Symbol.for('best:pipes')) ?? []),
             ...(getMethodDecorators(controllerType, route.handlerName, Symbol.for('best:pipes')) ?? []),
           ],
+          middlewares: [
+            ...this.options.globalMiddleware,
+            ...(getClassDecorators(controllerType, Symbol.for('best:middleware')) ?? []),
+            ...(getMethodDecorators(controllerType, route.handlerName, Symbol.for('best:middleware')) ?? []),
+          ],
           controllerType,
           // defaultStatus is attached via a non-enumerable property so the
           // route shape stays stable for consumers of `router.routes`.
@@ -219,11 +241,15 @@ export class Application {
 
   async #callHooks(hook: keyof LifecycleHook): Promise<void> {
     for (const provider of this.#providers) {
+      // A request-scoped provider has no application-level lifecycle, so its
+      // hooks run when the request ends.
+      if (this.container.requiresRequestScope(provider)) continue;
       const instance = this.container.resolve(provider);
       const fn = (instance as LifecycleHook)[hook];
       if (typeof fn === 'function') await fn.call(instance);
     }
     for (const controller of this.#controllers) {
+      if (this.container.requiresRequestScope(controller)) continue;
       const instance = this.container.resolve(controller);
       const fn = (instance as LifecycleHook)[hook];
       if (typeof fn === 'function') await fn.call(instance);
@@ -238,19 +264,31 @@ export class Application {
    * Resolve a cross-cutting member. Classes and tokens are looked up in the
    * container; already-constructed instances are used as-is.
    */
-  #resolveMember(member: any): any {
-    if (typeof member === 'function') return this.container.resolve(member);
-    return member;
+  #resolveMember(member: any, container: Container = this.container): any {
+    if (typeof member !== 'function') return member;
+    if (container.has(member)) return container.resolve(member);
+
+    // A member that declares no dependency and is not registered as a
+    // provider is instantiated directly, so a middleware or a guard does not
+    // have to be listed in the module to be used.
+    if (!container.hasDependencies(member)) {
+      const instance = new (member as new (...args: any[]) => unknown)();
+      container.registerValue(member, instance);
+      return instance;
+    }
+
+    return container.resolve(member);
   }
 
   /**
    * Execute a matched route through the pipeline:
-   * guards -> pipes -> handler -> interceptors (reverse) -> filters on error.
+   * middleware -> guards -> pipes -> handler -> interceptors (reverse) -> filters on error.
    */
   async execute(
     route: RouteDefinition,
     request: RequestContext,
   ): Promise<{ status: number; headers: Headers; body: unknown }> {
+    const container = this.container.createChild();
     const context: ExecutionContext = {
       method: request.method,
       path: request.path,
@@ -260,23 +298,37 @@ export class Application {
       body: request.body,
       request: request.raw,
       state: {},
+      container,
     };
 
     try {
+      const middlewareResult = await this.#runMiddleware(route, context, container);
+      if (middlewareResult) {
+        return {
+          status: middlewareResult.status,
+          headers: middlewareResult.headers,
+          body: middlewareResult.body,
+        };
+      }
+
       for (const guardType of route.guards) {
-        const guard = this.#resolveMember(guardType) as { canActivate(c: ExecutionContext): any };
+        const guard = this.#resolveMember(guardType, container) as {
+          canActivate(c: ExecutionContext): any;
+        };
         const allowed = await guard.canActivate(context);
         if (!allowed) {
           return { status: 403, headers: new Headers(), body: { statusCode: 403, message: 'Forbidden' } };
         }
       }
 
+      const handler = this.#resolveHandler(route, container);
       const args = await this.#buildHandlerArgs(route, request, context);
 
       const chain = async (index: number): Promise<unknown> => {
-        if (index >= route.interceptors.length) return route.handler(...args);
+        if (index >= route.interceptors.length) return handler(...args);
         const interceptor = this.#resolveMember(
           route.interceptors[index],
+          container,
         ) as NestInterceptor;
         return interceptor.intercept(context, () => chain(index + 1));
       };
@@ -286,14 +338,79 @@ export class Application {
       return { status, headers: new Headers(), body: result };
     } catch (error) {
       for (const filterType of route.filters) {
-        const filter = this.#resolveMember(filterType) as ExceptionFilter;
+        const filter = this.#resolveMember(filterType, container) as ExceptionFilter;
         const handled = filter.catch(error, context);
         if (handled !== undefined) {
           return { status: 200, headers: new Headers(), body: handled };
         }
       }
       throw error;
+    } finally {
+      await container.dispose();
     }
+  }
+
+  /**
+   * Runs the middleware of a route.
+   *
+   * The middleware run in order, and each one decides whether the request
+   * continues. A middleware that returns a `Response` answers the request
+   * itself, and the middleware after it does not run.
+   */
+  async #runMiddleware(
+    route: RouteDefinition,
+    context: ExecutionContext,
+    container: Container,
+  ): Promise<{ status: number; headers: Headers; body: unknown } | null> {
+    const middlewares = route.middlewares ?? [];
+
+    for (const middlewareType of middlewares) {
+      const middleware = this.#resolveMember(middlewareType, container) as NestMiddleware;
+      let response: void | Response;
+      let continued = false;
+
+      const next = async (): Promise<void> => {
+        continued = true;
+      };
+
+      response = await middleware.use(context, next);
+
+      if (response instanceof Response) {
+        // The body is passed as the Response itself, so the server writes it
+        // without re-encoding it.
+        return {
+          status: response.status,
+          headers: response.headers,
+          body: response,
+        };
+      }
+      if (!continued) {
+        throw new HttpException(500, {
+          statusCode: 500,
+          message: 'A middleware stopped the request without a response',
+        });
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * The handler of a route. A controller that depends on a request-scoped
+   * provider is resolved from the container of the request, so it gets a
+   * fresh instance for every request.
+   */
+  #resolveHandler(route: RouteDefinition, container: Container): (...args: any[]) => unknown {
+    if (!route.requestScoped) {
+      return route.handler as (...args: any[]) => unknown;
+    }
+
+    const instance = container.resolve(route.controllerType) as Record<string, unknown>;
+    const handler = instance[route.handlerName];
+    if (typeof handler !== 'function') {
+      throw new Error(`Handler "${route.handlerName}" not found on the controller`);
+    }
+    return handler.bind(instance) as (...args: any[]) => unknown;
   }
 
   async #buildHandlerArgs(
@@ -308,7 +425,7 @@ export class Application {
       let value: unknown;
       switch (param.source) {
         case 'body':
-          value = request.body;
+          value = context.body;
           break;
         case 'query':
           value = param.name ? request.query.get(param.name) : Object.fromEntries(request.query);

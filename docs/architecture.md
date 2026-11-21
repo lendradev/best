@@ -96,20 +96,40 @@ every other method of the same controller.
 
 ### 2.4 Request pipeline
 
-Order of execution:
+The pipeline runs in this order:
 
 ```
-middleware → guards → interceptors (pre) → pipes → handler
-           → interceptors (post) → response
-errors   → filters (route → controller → global)
+middleware -> guards -> pipes -> handler -> interceptors (reverse) -> filters
 ```
 
-Guards that return `false` short-circuit with `403`.
+Middleware runs first, because it is request-level work: reading a header,
+rejecting a token. A middleware calls `next()` to let the request continue,
+or returns a `Response` to answer it itself.
 
-Interceptors are plain async functions (`intercept(context, next)`). There is
-no observable type in the pipeline, and no dependency to provide one.
+A middleware or a guard that declares no dependency does not have to be
+listed in the module: the framework instantiates it directly. A member with
+dependencies has to be a provider of the module, so the container can resolve
+those dependencies.
 
-### 2.5 Routing
+### 2.5 Request scope
+
+Every request gets its own child container. The child delegates the unknown
+tokens to its parent, so the application-scoped providers stay shared while
+the request-scoped ones are created per child.
+
+The framework decides whether a controller has to be resolved per request by
+asking the container whether the controller depends on a request-scoped
+provider, directly or through another provider. Such a controller is scoped to
+the request, so it is not built at route-build time.
+
+The child container is released when the response is built. A request-scoped
+provider with an `onModuleDestroy` hook has it called at that point.
+
+The lifecycle hooks of a request-scoped provider run at the end of the
+request, not at the start of the application: a request-scoped provider has
+no application-level lifecycle.
+
+### 2.6 Routing
 
 Path patterns support `:param`, `:param?` (optional) and `*` (wildcard tail).
 Matching is anchored, so `/users` does not match `/users/1`.
@@ -117,7 +137,7 @@ Matching is anchored, so `/users` does not match `/users/1`.
 Controllers are decorated with `@Controller('/prefix')`; the application
 prefix is prepended to the controller prefix and the route path.
 
-### 2.6 Validation
+### 2.7 Validation
 
 `ValidationPipe` takes a plain rule object. There are no DTO classes and no
 validation library:
@@ -135,12 +155,12 @@ Rules support `type`, `required`, `min`, `max`, `minLength`, `maxLength`,
 Strings are **not** coerced: a number sent for a string field is a type error,
 not something to silently stringify.
 
-### 2.7 Lifecycle hooks
+### 2.8 Lifecycle hooks
 
 `onModuleInit` → `onApplicationBootstrap` → (shutdown)
 `beforeApplicationShutdown` → `onModuleDestroy` → `onApplicationShutdown`.
 
-### 2.8 Server
+### 2.9 Server
 
 `Bun.serve` with a `fetch` handler. The handler parses JSON, form-urlencoded
 and text bodies, enforces a body limit (default 1 MiB), and returns `404` for
@@ -402,6 +422,10 @@ controller name becomes the tag.
 | The token secret is required | A default secret would be a silent security hole | Every application has to supply one |
 | The token signature is HMAC-SHA-256 from `crypto.subtle` | It is the Web Crypto API and needs no dependency | Only HMAC is offered, not RSA or ECDSA |
 | The OpenAPI document is generated from the route table | The document cannot drift from the routes | The document describes the paths, not the payload shapes |
+| Middleware runs before the guards | Middleware is request-level work, so it has to happen before the route logic | A middleware cannot read a value the guards produced |
+| A member without dependencies is instantiated directly | A middleware or a guard does not have to be listed in the module | A member with dependencies has to be a provider |
+| Every request gets its own child container | Two requests never share a request-scoped instance | The container is allocated per request |
+| The container decides whether a controller is request-scoped | The controller holds the instance, so the decision has to follow the dependencies | The check walks the dependency graph once per controller |
 
 ---
 
@@ -412,10 +436,12 @@ controller name becomes the tag.
    must name its token.
 2. **Relations are not loaded automatically.** `include` is not implemented;
    joins must be written explicitly.
-3. **Request-scoped providers need an explicit child container.** The HTTP
-   layer currently uses the application container for every request.
-4. **Middleware is declared but not executed.** The `UseMiddleware` decorator
-   is exported, but it is not wired into the request pipeline yet.
+3. **Request-scoped providers are per request, not per worker.** The container
+   creates one child container per request and releases it when the response
+   is built.
+4. **Middleware has no path configuration.** A middleware applies to the route
+   it is declared on, or to every route when it is a global one. There is no
+   `forRoutes('*')` builder.
 5. **No GraphQL, microservice or message-broker support.** A protocol client
    for either is its own piece of work and would break the zero-dependency
    rule.
@@ -436,6 +462,9 @@ controller name becomes the tag.
 11. **The OpenAPI document describes the paths, not the payload shapes.** The
     route table carries no body or response schema, so the generated document
     has a generic `200` response. The extra schemas can be passed in by hand.
+12. **A request-scoped provider has no application lifecycle.** Its
+    `onModuleInit` and `onApplicationBootstrap` hooks do not run at startup;
+    `onModuleDestroy` runs when the request ends.
 
 ---
 
